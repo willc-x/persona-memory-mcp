@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>聊天历史 · AI模拟分身</title><link rel="stylesheet" href="/chat-static/app.css"><script src="/chat-static/app.js" defer></script></head>
+<body><main>
+<header><div><p class="eyebrow">ex-memory · 本机私密记忆</p><h1 id="heading">真实聊天历史 · AI模拟</h1></div><button id="logout" class="secondary hidden">退出登录</button></header>
+<p class="notice">对话依据指定时期的历史材料生成，不是真实当事人的新消息。历史事实优先；本页对话永不回填真实聊天历史。</p>
+<section id="login-card" class="card"><h2>本机登录</h2><p>首次账号密码保存在本机私有数据根的 <code>config/local-login.json</code>，请在本机打开复制。这里不填写模型 API Key。</p>
+<form id="login-form"><label>用户名<input id="username" autocomplete="username" value="chat-local" required></label><label>密码<input id="password" type="password" autocomplete="current-password" required></label><button type="submit">登录</button></form></section>
+<section id="workspace" class="hidden">
+<div class="settings card"><div><h2>记忆与服务状态</h2><p id="status">加载中…</p><p id="model-status"></p></div><div><label>检索／对话时期<select id="era"><option value="latest">不限时期：截至今天的真实历史</option></select></label><label>或指定证据截止日期<input type="date" id="cutoff"></label><p class="muted">日期筛选不代表亲密／疏远等关系结论。切换时期自动新建会话，不删除旧会话。</p><button id="new-chat" class="secondary">新建对话</button></div></div>
+<div class="chat-layout"><section class="card chat"><div id="messages" aria-live="polite"><p class="muted">可以先免费检索真实历史；生成对话需先明确授权服务并配置本项目密钥。</p></div>
+<form id="message-form"><label for="message">你的消息／想核对的历史问题</label><textarea id="message" rows="3" maxlength="5000" placeholder="例如：刚开始聊天时，对方说有几个聊天账号？" required></textarea><div class="actions"><button id="search" type="button" class="secondary">检索真实历史 · 本机</button><button id="send" type="submit">生成回复</button></div></form></section>
+<aside class="card"><h2>真实历史证据</h2><p id="evidence-status" class="muted">系统不会把本页对话列为这里的真实证据。</p><div id="sources"></div><h3>已保存的对话</h3><select id="conversations"><option value="">选择以继续会话</option></select></aside></div>
+</section><p id="error" role="alert"></p><footer>本机 Embedding · ChromaDB 真实历史 · 独立会话记忆 · 无证据则不确定</footer>
+</main></body></html>

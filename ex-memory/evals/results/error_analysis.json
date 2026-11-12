@@ -1,0 +1,80 @@
+{
+ "meta": {
+  "n_queries": 147,
+  "n_failed": 10,
+  "fail_rate": 0.06802721088435375
+ },
+ "by_category": [
+  {
+   "category": "偏好",
+   "n": 39,
+   "recall@10": 0.8461538461538461,
+   "mrr": 0.7863247863247863,
+   "n_failed": 6,
+   "fail_rate": 0.15384615384615385
+  },
+  {
+   "category": "经历",
+   "n": 36,
+   "recall@10": 0.9305555555555556,
+   "mrr": 0.8564814814814814,
+   "n_failed": 3,
+   "fail_rate": 0.08333333333333333
+  },
+  {
+   "category": "习惯怪癖",
+   "n": 24,
+   "recall@10": 0.9583333333333334,
+   "mrr": 0.7847222222222222,
+   "n_failed": 1,
+   "fail_rate": 0.041666666666666664
+  },
+  {
+   "category": "健康约定",
+   "n": 12,
+   "recall@10": 1.0,
+   "mrr": 0.9270833333333334,
+   "n_failed": 0,
+   "fail_rate": 0.0
+  },
+  {
+   "category": "家庭朋友",
+   "n": 18,
+   "recall@10": 1.0,
+   "mrr": 0.9629629629629629,
+   "n_failed": 0,
+   "fail_rate": 0.0
+  },
+  {
+   "category": "工作学校",
+   "n": 18,
+   "recall@10": 1.0,
+   "mrr": 0.6976851851851852,
+   "n_failed": 0,
+   "fail_rate": 0.0
+  }
+ ],
+ "failure_modes": {
+  "no_relevant": 6,
+  "heldout": 2,
+  "partial_recall": 1,
+  "missed_evidence": 1
+ },
+ "failure_mode_labels": {
+  "heldout": "留出组（预期失败：知识已剔除）",
+  "no_relevant": "库中无相关 chunk（结构缺口）",
+  "missed_evidence": "有证据未召回（检索质量）",
+  "partial_recall": "只命中部分证据"
+ },
+ "generalization": {
+  "known_recall@10": 0.9492753623188406,
+  "heldout_recall@10": 0.0,
+  "gap": 0.9492753623188406,
+  "passes": true
+ },
+ "summary": [
+  "最薄弱类别：偏好（recall@10=84.6%，6/39 失败）",
+  "主导失败模式：库中无相关 chunk（结构缺口）（6 条）",
+  "留出切分有效：留出组召回≈0，被剔除的证据未被误召回（仅证明切分无泄漏；不涉及检索质量，也不代表模型能正确拒答）"
+ ]
+}

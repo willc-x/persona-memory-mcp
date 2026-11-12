@@ -1,0 +1,162 @@
+"""ChromaDB 向量库封装：ingest / search / search_target_only。"""
+
+import hashlib
+import logging
+from typing import Optional, Callable
+import chromadb
+from memory.embedder import Embedder
+
+logger = logging.getLogger("ex-memory")
+
+
+class IngestError(Exception):
+    """入库异常，携带已成功写入的批次数。"""
+
+    def __init__(self, message: str, batches_completed: int = 0):
+        super().__init__(message)
+        self.batches_completed = batches_completed
+
+
+class VectorStore:
+    def __init__(self, persist_dir: str, collection_name: str):
+        self.client = chromadb.PersistentClient(path=persist_dir)
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+    def ingest(
+        self,
+        chunks: list[dict],
+        embedder: Embedder,
+        batch_size: int = 100,
+        on_batch: Optional[Callable[[int, int], None]] = None,
+    ):
+        """批量写入 chunks。
+
+        每个 chunk 应包含:
+            - id: 唯一标识
+            - text_for_embedding: 用于向量化的文本
+            - display_text: 用于展示的原文
+            - metadata: source, chat_id, dominant_speaker, start_ts, end_ts, ...
+
+        on_batch: 每批次成功后的回调 (completed, total)
+        """
+        total = len(chunks)
+        total_batches = (total + batch_size - 1) // batch_size
+        batches_done = 0
+
+        for i in range(0, total, batch_size):
+            batch = chunks[i : i + batch_size]
+            ids = [c["id"] for c in batch]
+            documents = [c["text_for_embedding"] for c in batch]
+            metadatas = []
+            for c in batch:
+                meta = {k: v for k, v in c.get("metadata", {}).items() if v is not None}
+                # ChromaDB metadata 值只能是 str/int/float/bool
+                for k, v in meta.items():
+                    if isinstance(v, list):
+                        meta[k] = str(v)
+                meta["display_text"] = c.get("display_text", "")
+                metadatas.append(meta)
+
+            try:
+                embeddings = embedder.embed(documents)
+            except Exception as e:
+                raise IngestError(
+                    f"Embedding 失败 (批次 {batches_done + 1}/{total_batches}): {e}",
+                    batches_completed=batches_done,
+                ) from e
+
+            try:
+                self.collection.add(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=documents,
+                    metadatas=metadatas,
+                )
+            except Exception as e:
+                raise IngestError(
+                    f"ChromaDB 写入失败 (批次 {batches_done + 1}/{total_batches}): {e}",
+                    batches_completed=batches_done,
+                ) from e
+
+            batches_done += 1
+            logger.info("入库进度: %d/%d", min(i + batch_size, total), total)
+            if on_batch:
+                on_batch(batches_done, total_batches)
+
+    def search(
+        self,
+        query: str,
+        embedder: Embedder,
+        top_k: int = 10,
+        where: Optional[dict] = None,
+        where_document: Optional[dict] = None,
+    ) -> list[dict]:
+        """语义检索，支持 metadata 过滤。"""
+        query_embedding = embedder.embed_one(query)
+        kwargs = {
+            "query_embeddings": [query_embedding],
+            "n_results": top_k,
+        }
+        if where:
+            kwargs["where"] = where
+        if where_document:
+            kwargs["where_document"] = where_document
+
+        results = self.collection.query(**kwargs)
+
+        output = []
+        if results and results["documents"] and results["documents"][0]:
+            ids = (results.get("ids") or [[]])[0]
+            for i, doc in enumerate(results["documents"][0]):
+                meta = results["metadatas"][0][i] if results["metadatas"] else {}
+                score = 1 - results["distances"][0][i] if results["distances"] else 0
+                output.append(
+                    {
+                        "id": ids[i] if i < len(ids) else None,
+                        "display_text": meta.get("display_text", doc),
+                        "score": score,
+                        "metadata": meta,
+                    }
+                )
+        return output
+
+    def search_target_only(
+        self, query: str, embedder: Embedder, top_k: int = 10
+    ) -> list[dict]:
+        """便捷方法：只检索 dominant_speaker == 'target' 的原话。"""
+        return self.search(
+            query=query,
+            embedder=embedder,
+            top_k=top_k,
+            where={"dominant_speaker": "target"},
+        )
+
+    def add_session_summary(self, text: str, slug: str, embedder: Embedder):
+        """将 session 摘要写入向量库。"""
+        embedding = embedder.embed_one(text)
+        stable_id = hashlib.md5(text.encode()).hexdigest()[:16]
+        self.collection.add(
+            ids=[f"session_{slug}_{stable_id}"],
+            embeddings=[embedding],
+            documents=[text],
+            metadatas=[
+                {
+                    "source": "session_summary",
+                    "dominant_speaker": "session",
+                    "display_text": text[:200],
+                }
+            ],
+        )
+
+    def count(self) -> int:
+        """返回 collection 中的记录数。"""
+        return self.collection.count()
+
+    def delete_collection(self):
+        """删除整个 collection，并将内部引用标记为无效。"""
+        name = self.collection.name
+        self.client.delete_collection(name)
+        self.collection = None  # 标记为已删除，防止后续操作 crash

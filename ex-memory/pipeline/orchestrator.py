@@ -1,0 +1,521 @@
+"""自动化蒸馏调度：从原始数据到可对话的完整流水线。"""
+
+import json
+import logging
+from contextlib import contextmanager
+from typing import Optional
+from datetime import datetime
+from pathlib import Path
+from prompt_toolkit import prompt as pt_prompt
+
+from config import (
+    get_ex_dir,
+    ensure_ex_dirs,
+    get_embedding_config,
+    get_llm_config,
+    get_collection_name,
+)
+from core.mirror_store import mirror_store
+from core.version_manager import backup as version_backup
+from memory.embedder import Embedder
+from memory.vector_store import VectorStore
+from memory.chunker import Chunker
+from pipeline.memory_builder import build_memory
+from pipeline.persona_builder import build_persona
+from pipeline.skill_combiner import write_skill
+
+logger = logging.getLogger("ex-memory")
+
+# 管线步骤顺序
+PIPELINE_STEPS = ["import", "distill_memory", "distill_persona", "skill"]
+
+
+@contextmanager
+def import_creation_lock(slug: str, owner=None):
+    """同一个镜像的上传和恢复不能同时改写初次生成结果。"""
+    from core.file_utils import _lock, fcntl
+
+    store = mirror_store(slug, owner)
+    with store.path(".import.lock").open("a+") as lock_file:
+        try:
+            _lock(lock_file, fcntl.LOCK_EX)
+        except TimeoutError as exc:
+            raise RuntimeError("该镜像正在导入或生成，请等待当前任务完成") from exc
+        yield
+
+
+def _imported_materials(slug: str, owner=None) -> str:
+    from core.corpus_store import load_messages
+
+    messages = load_messages(slug, owner)
+    if not messages or not any(m.get("is_target") for m in messages):
+        raise ValueError("尚未导入目标人物的有效聊天记录，请重新上传")
+    # 限制输入长度，同时覆盖记录的前后时间段和目标人物原话。
+    sampled = []
+    for group, limit in (
+        ([m for m in messages if m.get("is_target")], 60),
+        ([m for m in messages if not m.get("is_target")], 20),
+    ):
+        for i in range(min(limit, len(group))):
+            sampled.append(group[i * len(group) // min(limit, len(group))])
+    lines = [f"## 已导入聊天记录样本（共 {len(messages)} 条消息）"]
+    for message in sampled:
+        role = "目标人物" if message.get("is_target") else "其他说话人"
+        lines.append(
+            f"- [{message.get('timestamp', '')}] {message.get('sender', '')}"
+            f"（{role}）：{message.get('content', '')[:200]}"
+        )
+    return "\n".join(lines)
+
+
+def _save_failed_state(slug: str, step: str, error: Exception, owner=None):
+    """保存失败状态到 meta.json。"""
+    store = mirror_store(slug, owner)
+    meta = store.read_json("meta.json") if store.exists("meta.json") else {}
+    meta["pipeline_state"] = "failed"
+    meta["failed_step"] = step
+    meta["error"] = str(error)[:500]
+    meta["updated_at"] = datetime.now().isoformat()
+    store.write_json("meta.json", meta)
+
+
+def run_create_flow(slug: Optional[str] = None):
+    """执行完整的创建流程。
+
+    slug: 恢复已有镜像的创建流程（从失败步骤继续）
+    """
+
+    # ===== 检查是否为恢复模式 =====
+    existing_meta = None
+    if slug:
+        ex_dir = get_ex_dir(slug)
+        meta_path = ex_dir / "meta.json"
+        if meta_path.exists():
+            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if existing_meta.get("pipeline_state") == "failed" and existing_meta.get(
+                "failed_step"
+            ):
+                failed_step = existing_meta["failed_step"]
+                print("\n=== 恢复创建流程 ===")
+                print(f"镜像 [{existing_meta['name']}] 上次在 [{failed_step}] 步骤失败")
+                print(f"错误信息: {existing_meta.get('error', '未知')}")
+                confirm = pt_prompt("从失败步骤继续？(y/n): ").strip().lower()
+                if confirm not in ("y", "yes", "是", ""):
+                    print("已取消")
+                    return
+            else:
+                existing_meta = None  # 非失败状态，走全新流程
+
+    # ===== Step 1: 基础信息录入 =====
+    if existing_meta:
+        # 恢复模式：从 meta.json 读取已有信息
+        name = str(existing_meta["name"])
+        slug = str(existing_meta["slug"])
+        basic_info = existing_meta.get("profile", {}).get("basic_info", "")
+        personality = existing_meta.get("profile", {}).get("personality", "")
+        ex_dir = get_ex_dir(slug)
+        print(f"\n恢复镜像 [{name}] 的创建流程...")
+    else:
+        # 全新模式
+        print("\n=== 前任记忆智能体 — 创建向导 ===\n")
+
+        name = str(pt_prompt("给ta起个代号（昵称/备注名/外号）: ")).strip()
+        if not name:
+            print("错误：代号不能为空")
+            return
+
+        slug = name.lower().replace(" ", "_")
+
+        print("\n一句话介绍一下？（在一起多久、分手多久、ta做什么的）")
+        print("示例：在一起两年 分手半年 互联网产品经理 上海")
+        basic_info = pt_prompt("基本信息（可跳过）: ").strip()
+
+        print("\n用一句话描述ta的性格？（MBTI、星座、性格标签）")
+        print("示例：ENFP 双子座 话很多 永远在社交 但深夜会突然emo")
+        personality = pt_prompt("性格画像（可跳过）: ").strip()
+
+        # 汇总确认
+        print("\n=== 信息确认 ===")
+        print(f"  代号：{name}")
+        print(f"  基本信息：{basic_info or '（未填写）'}")
+        print(f"  性格画像：{personality or '（未填写）'}")
+
+        confirm = pt_prompt("\n确认？(y/n): ").strip().lower()
+        if confirm not in ("y", "yes", "是", ""):
+            print("已取消")
+            return
+
+        # 创建目录
+        ex_dir = ensure_ex_dirs(slug)
+        store = mirror_store(slug)
+
+        # 写入初始 meta.json
+        meta = {
+            "name": name,
+            "slug": slug,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "version": "v1",
+            "profile": {
+                "basic_info": basic_info,
+                "personality": personality,
+            },
+            "pipeline_state": "intake_done",
+        }
+        store.write_json("meta.json", meta)
+
+        # 事前备份
+        try:
+            version_backup(slug, "pre_create", include_chroma=True)
+        except Exception as e:
+            # 事前备份失败不阻断创建，但失去回滚点，必须留痕
+            logger.warning("镜像 [%s] 事前备份失败，本次无回滚点: %s", slug, e)
+
+    # 判断从哪一步开始
+    # 上面两个分支都已确定 slug；显式收敛类型，避免下游反复出现 Optional
+    if slug is None:
+        raise RuntimeError("内部错误：镜像 slug 未能确定")
+
+    store = mirror_store(slug)
+
+    failed_step = existing_meta.get("failed_step") if existing_meta else None
+    steps = ["import", "distill_memory", "distill_persona", "skill"]
+    start_idx = steps.index(failed_step) if failed_step in steps else 0
+
+    materials_summary = (
+        f"代号：{name}\n基本信息：{basic_info}\n性格画像：{personality}\n\n"
+    )
+
+    # 初始化向量库（import 步骤需要）
+    emb_cfg = get_embedding_config()
+    embedder = Embedder(
+        api_key=emb_cfg["api_key"], base_url=emb_cfg["base_url"], model=emb_cfg["model"]
+    )
+    chroma_dir = str(store.path("chroma_db"))
+    collection_name = get_collection_name(slug)
+    vector_store = VectorStore(persist_dir=chroma_dir, collection_name=collection_name)
+    chunker = Chunker()
+
+    # ===== Step 2: 数据源导入 =====
+    if start_idx <= 0:
+        print("\n=== 数据源导入 ===")
+        print("回忆越多，还原度越高。")
+        print("[A] 聊天记录导出")
+        print("[B] 直接粘贴/口述")
+        print("[C] 跳过（仅凭上述信息生成）")
+
+        source_choice = pt_prompt("选择 (A/B/C): ").strip().upper()
+
+        try:
+            if source_choice == "A":
+                _import_chat(ex_dir, slug, name, vector_store, embedder, chunker)
+            elif source_choice == "B":
+                _import_oral(ex_dir, slug, name, vector_store, embedder, chunker)
+            else:
+                print("跳过数据导入。")
+        except Exception as e:
+            logger.error("数据导入失败: %s", e, exc_info=True)
+            _save_failed_state(slug, "import", e)
+            print(f"数据导入失败: {e}")
+            print("请修复问题后重新运行 /create 并输入代号继续。")
+            return
+
+    # 构建材料摘要（从已入库的数据中采样）
+    try:
+        sample_results = vector_store.search("日常对话", embedder, top_k=20)
+        if sample_results:
+            materials_summary += "\n## 聊天记录样本\n"
+            for r in sample_results[:10]:
+                materials_summary += f"- {r.get('display_text', '')[:200]}\n"
+    except Exception as e:
+        # 样本检索失败只是少了参考素材，蒸馏仍可继续
+        logger.warning("检索聊天记录样本失败 slug=%s: %s", slug, e)
+
+    # ===== Step 3: 蒸馏 =====
+    llm_cfg = get_llm_config()
+    if not llm_cfg["api_key"]:
+        print("警告：未配置 LLM API Key，跳过自动蒸馏。")
+        print("请手动创建 memory.md 和 persona.md 后运行 /create 的后续步骤。")
+        return
+
+    if start_idx <= 1:
+        print("\n=== 开始蒸馏 ===")
+        print("正在生成 Relationship Memory...")
+        try:
+            memory_content = build_memory(slug, materials_summary)
+            store.write_text("memory.md", memory_content)
+            print("  memory.md 已生成")
+        except Exception as e:
+            logger.error("生成 memory.md 失败: %s", e, exc_info=True)
+            _save_failed_state(slug, "distill_memory", e)
+            print(f"生成 memory.md 失败: {e}")
+            print("可稍后重新运行 /create 并输入代号继续。")
+            return
+
+    if start_idx <= 2:
+        print("正在生成 Persona（含原话样本抽取）...")
+        try:
+            persona_content = build_persona(
+                slug, materials_summary, vector_store, embedder
+            )
+            store.write_text("persona.md", persona_content)
+            print("  persona.md 已生成")
+        except Exception as e:
+            logger.error("生成 persona.md 失败: %s", e, exc_info=True)
+            _save_failed_state(slug, "distill_persona", e)
+            print(f"生成 persona.md 失败: {e}")
+            print("可稍后重新运行 /create 并输入代号继续。")
+            return
+
+    # ===== Step 4: 生成 SKILL.md =====
+    if start_idx <= 3:
+        print("正在生成 SKILL.md...")
+        try:
+            write_skill(slug)
+        except Exception as e:
+            logger.error("生成 SKILL.md 失败: %s", e, exc_info=True)
+            _save_failed_state(slug, "skill", e)
+            print(f"生成 SKILL.md 失败: {e}")
+            return
+
+    # 更新 meta.json
+    meta = store.read_json("meta.json")
+    meta["pipeline_state"] = "completed"
+    meta.pop("failed_step", None)
+    meta.pop("error", None)
+    meta["updated_at"] = datetime.now().isoformat()
+    store.write_json("meta.json", meta)
+
+    # 展示摘要
+    print("\n=== 创建完成！===")
+    print(f"前任 [{name}] 的数字镜像已就绪。")
+    print(f"输入 /{slug} 开始对话。\n")
+
+
+def _import_chat(ex_dir: Path, slug: str, name: str, vector_store, embedder, chunker):
+    """导入聊天记录。"""
+    from parsers.chat_parser import parse as chat_parse
+
+    file_path = pt_prompt("聊天记录文件路径: ").strip()
+    if not file_path:
+        print("未提供文件，跳过。")
+        return
+
+    file_path = file_path.strip('"').strip("'")
+    if not Path(file_path).exists():
+        print(f"文件不存在: {file_path}")
+        return
+
+    print("正在解析聊天记录...")
+    messages = chat_parse(file_path, target_name=name)
+    print(f"  解析完成：{len(messages)} 条消息")
+
+    if not messages:
+        print("  未提取到有效消息。")
+        return
+
+    print("正在切片入库...")
+    chunks = chunker.chunk_messages(messages, source="chat", chat_id=f"chat_{slug}")
+    print(f"  切片完成：{len(chunks)} 个 chunks")
+
+    if chunks:
+        vector_store.ingest(chunks, embedder)
+        print(f"  入库完成：{vector_store.count()} 条记录")
+
+
+def _import_oral(ex_dir: Path, slug: str, name: str, vector_store, embedder, chunker):
+    """导入口述/粘贴文本。"""
+    from parsers.oral_parser import parse as oral_parse
+
+    print("\n请粘贴你想记录的内容（输入空行结束）：")
+    lines = []
+    while True:
+        try:
+            line = input()
+            if line == "":
+                break
+            lines.append(line)
+        except EOFError:
+            break
+
+    text = "\n".join(lines)
+    if not text.strip():
+        print("未输入内容，跳过。")
+        return
+
+    messages = oral_parse(text, target_name=name)
+    print(f"  解析完成：{len(messages)} 条消息")
+
+    chunks = chunker.chunk_text(text, source="oral")
+    if chunks:
+        vector_store.ingest(chunks, embedder)
+        print(f"  入库完成：{vector_store.count()} 条记录")
+
+
+def run_create_flow_api(
+    slug: str,
+    name: str,
+    answers: list[str],
+    resume: bool = False,
+    owner_user_id=None,
+    defer_generation: bool = False,
+    from_import: bool = False,
+) -> dict:
+    """API 版创建流程：接收参数而非交互式输入，返回结果字典。
+
+    resume: 为 True 时从上次失败步骤继续（需已有 meta.json）
+    """
+
+    try:
+        store = mirror_store(slug, owner_user_id)
+
+        # 恢复模式：读取已有 meta
+        if resume:
+            if not store.exists("meta.json"):
+                return {"error": "未找到创建记录，无法恢复"}
+            meta = store.read_json("meta.json")
+            if meta.get("pipeline_state") != "failed" and not (
+                from_import and meta.get("pipeline_state") == "awaiting_import"
+            ):
+                return {"error": "该镜像未处于失败状态，无需恢复"}
+            failed_step = meta.get("failed_step", "")
+            start_idx = (
+                PIPELINE_STEPS.index(failed_step)
+                if failed_step in PIPELINE_STEPS
+                else 0
+            )
+            basic_info = meta.get("profile", {}).get("basic_info", "")
+            personality = meta.get("profile", {}).get("personality", "")
+            name = meta.get("name", name)
+        else:
+            if store.exists("meta.json"):
+                return {"error": "镜像已存在，不能覆盖已有记录"}
+            basic_info = answers[0] if len(answers) > 0 else ""
+            personality = answers[1] if len(answers) > 1 else ""
+            start_idx = 0
+
+            meta = {
+                "name": name,
+                "slug": slug,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "version": "v1",
+                "profile": {
+                    "basic_info": basic_info,
+                    "personality": personality,
+                },
+                "pipeline_state": "awaiting_import" if defer_generation else "intake_done",
+            }
+            if defer_generation:
+                meta["creation_source"] = "chat_import"
+                meta["stage"] = "source"
+            if owner_user_id is not None:
+                meta["owner_user_id"] = owner_user_id
+            store.write_json("meta.json", meta)
+
+            if defer_generation:
+                return {"slug": slug, "name": name, "state": "awaiting_import"}
+
+            # 事前备份
+            try:
+                version_backup(
+                    slug,
+                    "pre_create",
+                    include_chroma=True,
+                    owner=owner_user_id,
+                )
+            except Exception as e:
+                logger.warning("镜像 [%s] 事前备份失败，本次无回滚点: %s", slug, e)
+
+        materials_summary = (
+            f"代号：{name}\n基本信息：{basic_info}\n性格画像：{personality}\n\n"
+        )
+        if meta.get("creation_source") == "chat_import":
+            try:
+                materials_summary += _imported_materials(slug, owner_user_id)
+            except ValueError as exc:
+                _save_failed_state(slug, "import", exc, owner=owner_user_id)
+                return {"error": str(exc)}
+            if from_import:
+                start_idx = 1
+        generation_options = (
+            {"source_grounded": True}
+            if meta.get("creation_source") == "chat_import" else {}
+        )
+
+        # 初始化向量库和 embedder
+        emb_cfg = get_embedding_config(owner_user_id) if owner_user_id is not None else get_embedding_config()
+        embedder = None
+        vector_store = None
+        if emb_cfg["api_key"]:
+            embedder = Embedder(
+                api_key=emb_cfg["api_key"],
+                base_url=emb_cfg["base_url"],
+                model=emb_cfg["model"],
+                **({"owner": owner_user_id, "model_config": emb_cfg} if owner_user_id is not None else {}),
+            )
+            vector_store = VectorStore(
+                persist_dir=str(store.path("chroma_db")),
+                collection_name=get_collection_name(slug),
+            )
+
+        # 蒸馏
+        llm_cfg = get_llm_config(owner_user_id) if owner_user_id is not None else get_llm_config()
+        if owner_user_id is not None:
+            from server.model_settings import SettingsConflict
+            from core.factory import check_embedding_identity
+
+            if emb_cfg["api_key"] and emb_cfg["revision"] != llm_cfg["revision"]:
+                raise SettingsConflict("模型配置已更新，请重试")
+            if vector_store is not None:
+                check_embedding_identity(slug, owner_user_id, vector_store, emb_cfg)
+            generation_options.update(owner=owner_user_id, model_config=llm_cfg)
+        if not llm_cfg["api_key"]:
+            _save_failed_state(
+                slug, "distill_memory", RuntimeError("未配置 LLM API Key"), owner=owner_user_id
+            )
+            return {"error": "未配置 LLM API Key"}
+
+        if start_idx <= 1:
+            try:
+                memory_content = build_memory(slug, materials_summary, **generation_options)
+                if not isinstance(memory_content, str) or not memory_content.strip():
+                    raise ValueError("模型未返回有效记忆，请重试")
+                store.write_text("memory.md", memory_content)
+            except Exception as e:
+                _save_failed_state(slug, "distill_memory", e, owner=owner_user_id)
+                return {"error": f"生成 memory.md 失败: {e}"}
+
+        if start_idx <= 2:
+            try:
+                persona_content = build_persona(
+                    slug, materials_summary, vector_store, embedder, **generation_options
+                )
+                if not isinstance(persona_content, str) or not persona_content.strip():
+                    raise ValueError("模型未返回有效人物画像，请重试")
+                store.write_text("persona.md", persona_content)
+            except Exception as e:
+                _save_failed_state(slug, "distill_persona", e, owner=owner_user_id)
+                return {"error": f"生成 persona.md 失败: {e}"}
+
+        if start_idx <= 3:
+            try:
+                write_skill(slug, owner=owner_user_id)
+            except Exception as e:
+                _save_failed_state(slug, "skill", e, owner=owner_user_id)
+                return {"error": f"生成 SKILL.md 失败: {e}"}
+
+        # 读取最新 meta 并更新
+        meta = store.read_json("meta.json")
+        meta["pipeline_state"] = "completed"
+        meta.pop("failed_step", None)
+        meta.pop("error", None)
+        meta["updated_at"] = datetime.now().isoformat()
+        store.write_json("meta.json", meta)
+
+        logger.info("API 创建完成: %s", slug)
+        return {"slug": slug, "name": name, "state": "completed"}
+
+    except Exception as e:
+        logger.error("API 创建失败: %s", e, exc_info=True)
+        return {"error": str(e)}

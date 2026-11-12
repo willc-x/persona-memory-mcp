@@ -1,0 +1,44 @@
+services:
+  ex-memory:
+    build: .
+    image: ex-memory:online-experience
+    container_name: ex-memory-online
+    ports:
+      - "127.0.0.1:18000:8000"
+    environment:
+      # 网站按账号使用自带凭据，不能回退消耗站主的 API 额度。
+      LLM_API_KEY: ""
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      EMBEDDING_API_KEY: ""
+      MODEL_SETTINGS_ENCRYPTION_KEY: ${MODEL_SETTINGS_ENCRYPTION_KEY:?MODEL_SETTINGS_ENCRYPTION_KEY is required}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      METEOR_STORE_SSO_ENABLED: "true"
+      METEOR_STORE_PROXY_TOKEN: ${METEOR_STORE_PROXY_TOKEN:?METEOR_STORE_PROXY_TOKEN is required}
+      PUBLIC_BASE_PATH: /ex-memory-runtime
+      DISABLE_REGISTRATION: "true"
+      SINGLE_USER_MODE: "false"
+      TRUSTED_PROXY: "true"
+      # 必须与 TRUSTED_PROXY 配套：只有来自这些直连 IP 的 X-Forwarded-For 才被采信。
+      # 留空会让限流退化为按直连 IP 计（fail-closed），而不是信任伪造头。
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-172.17.0.1,127.0.0.1}
+      CORS_ORIGINS: https://imagentx.top
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # 网站实验室当前免费，升级不能自动启用源码中的按轮次收费默认值。
+      TURN_PRICE_MICROS: "0"
+      LOCAL_CHAT_HELPER_ENABLED: ${LOCAL_CHAT_HELPER_ENABLED:-true}
+      LOCAL_CHAT_HELPER_VERSION: ${LOCAL_CHAT_HELPER_VERSION:-0.1.0-beta.4}
+      LOCAL_CHAT_HELPER_MIN_API_VERSION: ${LOCAL_CHAT_HELPER_MIN_API_VERSION:-1}
+      LOCAL_CHAT_HELPER_ARM64_URL: ${LOCAL_CHAT_HELPER_ARM64_URL:-https://imagentx.top/downloads/ex-memory/0.1.0-beta.4/ex-memory-chat-helper-0.1.0-beta.4-macos-arm64.dmg}
+      LOCAL_CHAT_HELPER_ARM64_SHA256: ${LOCAL_CHAT_HELPER_ARM64_SHA256:-e8590885cae3135c248af6be36ac8facc3003bd378c8715e177d393069194ab5}
+    volumes:
+      - ./data:/app/data
+      - ./exes:/app/exes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

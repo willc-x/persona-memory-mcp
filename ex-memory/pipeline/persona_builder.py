@@ -1,0 +1,166 @@
+"""调用 LLM 生成 persona.md（含 9 场景原话样本抽取 + 主动回忆原话）。"""
+
+from pathlib import Path
+from config import get_llm_config, get_llm_client
+
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+# 9 个场景及其检索 query
+SPEECH_SCENES = [
+    ("打招呼/开场", "哈喽 hi 在吗 你好 hey"),
+    ("日常问候", "吃了吗 在干嘛 今天怎么样"),
+    ("开心/分享", "哈哈哈 好开心 太棒了 笑死"),
+    ("冷淡/不满", "哦 随便 你说了算 行吧"),
+    ("撒娇/委屈", "哼 你都不理我 委屈 呜呜"),
+    ("生气/争吵", "你什么意思 说了多少次 烦不烦"),
+    ("吃醋/占有欲", "你跟谁 你是不是 又是谁"),
+    ("感谢/认可", "谢谢 你真好 辛苦了 有你真好"),
+    ("告别/晚安", "拜拜 晚安 下次聊 先睡了"),
+]
+
+# 主动回忆场景：检索有代表性的原话，用于 AI 在对话中自然提起
+RECALL_SCENES = [
+    ("开心回忆", "好开心 太棒了 哈哈哈 笑死 最开心"),
+    ("感动瞬间", "好感动 谢谢你 有你真好 幸福"),
+    ("日常小事", "今天 告诉你 分享 你知道吗"),
+    ("约定/计划", "下次 一起 约好 要去 什么时候"),
+]
+
+SOURCE_SPEECH_SCENES = [
+    ("问候", "你好 最近怎么样"),
+    ("日常分享", "今天 分享 事情"),
+    ("提问与讨论", "为什么 怎么看 讨论"),
+    ("同意与拒绝", "可以 同意 不行 不方便"),
+    ("感谢与告别", "谢谢 再见 下次聊"),
+]
+SOURCE_RECALL_SCENES = [
+    ("计划与约定", "计划 时间 地点 一起"),
+    ("经历与偏好", "经历 喜欢 习惯"),
+]
+
+
+def build_persona(
+    slug: str,
+    materials_summary: str,
+    vector_store=None,
+    embedder=None,
+    *,
+    source_grounded: bool = False,
+    owner=None,
+    model_config=None,
+) -> str:
+    """生成 persona.md 内容。
+
+    Args:
+        slug: 前任代号
+        materials_summary: 原材料摘要（来自解析器的统计 + 用户口述）
+        vector_store: 向量库实例（用于抽取原话样本）
+        embedder: embedding 实例
+
+    Returns:
+        persona.md 的完整内容
+    """
+    cfg = model_config if model_config is not None else (
+        get_llm_config(owner) if owner is not None else get_llm_config()
+    )
+    client = get_llm_client(owner, cfg) if owner is not None else get_llm_client()
+
+    # 读取 prompt 模板
+    suffix = "_source_grounded" if source_grounded else ""
+    analyzer_prompt = (PROMPTS_DIR / f"persona_analyzer{suffix}.md").read_text(encoding="utf-8")
+    builder_prompt = (PROMPTS_DIR / f"persona_builder{suffix}.md").read_text(encoding="utf-8")
+
+    # Step 1: 分析性格特征
+    analysis_response = client.chat.completions.create(
+        model=cfg["model"],
+        messages=[
+            {"role": "system", "content": analyzer_prompt},
+            {
+                "role": "user",
+                "content": f"请分析以下原材料，提取性格特征和行为模式：\n\n{materials_summary}",
+            },
+        ],
+        temperature=0.7,
+    )
+    analysis = analysis_response.choices[0].message.content
+
+    # Step 2: 抽取 9 场景原话样本
+    speech_samples = ""
+    if vector_store and embedder:
+        samples = []
+        for scene_name, query in (SOURCE_SPEECH_SCENES if source_grounded else SPEECH_SCENES):
+            results = vector_store.search_target_only(query, embedder, top_k=8)
+            picked = []
+            seen = set()
+            for r in results:
+                text = r.get("display_text", "").strip()
+                if text and len(text) > 2 and text not in seen:
+                    seen.add(text)
+                    picked.append(text)
+                if len(picked) >= 3:
+                    break
+            if picked:
+                samples.append(f"### {scene_name}")
+                for p in picked:
+                    samples.append(f"- {p}")
+        if samples:
+            speech_samples = "\n".join(samples)
+
+    # Step 2.5: 抽取主动回忆原话样本
+    recall_samples = ""
+    if vector_store and embedder:
+        recall_parts = []
+        for scene_name, query in (SOURCE_RECALL_SCENES if source_grounded else RECALL_SCENES):
+            results = vector_store.search_target_only(query, embedder, top_k=6)
+            picked = []
+            seen = set()
+            for r in results:
+                text = r.get("display_text", "").strip()
+                if text and len(text) > 3 and text not in seen:
+                    seen.add(text)
+                    picked.append(text)
+                if len(picked) >= 2:
+                    break
+            if picked:
+                recall_parts.append(f"#### {scene_name}")
+                for p in picked:
+                    recall_parts.append(f"- {p}")
+        if recall_parts:
+            recall_samples = "\n".join(recall_parts)
+
+    # Step 3: 生成完整 persona.md
+    recall_section = ""
+    if recall_samples:
+        recall_section = (
+            f"\n\n## 主动回忆原话（用于对话中自然提起 ta 曾说过的话）\n{recall_samples}"
+        )
+
+    user_content = f"""请根据以下分析结果生成 persona.md：
+
+## 性格分析
+{analysis}
+
+## 原话样本（从聊天记录中提取的真实原话）
+{speech_samples if speech_samples else "（无原话样本，请基于分析结果推断）"}
+{recall_section}
+请按照 persona_builder.md 的 5 层结构输出完整的 persona.md。"""
+    if source_grounded:
+        user_content = (
+            "请核对材料与检索片段，生成以证据为准的 persona.md。\n"
+            "区分目标人物与其他说话人，区分原话、有限推断、未知。\n\n"
+            f"## 原始材料\n{materials_summary}\n\n## 分析草稿\n{analysis}\n\n"
+            f"## 检索片段（保留说话人，不将他人的话归给目标人物）\n"
+            f"{speech_samples or '无可核验的检索原话，对应项标记未知，不补写。'}\n"
+            f"{recall_samples}"
+        )
+
+    build_response = client.chat.completions.create(
+        model=cfg["model"],
+        messages=[
+            {"role": "system", "content": builder_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.7,
+    )
+
+    return build_response.choices[0].message.content

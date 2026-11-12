@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#0a0a12">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:17653; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+    <title>Ex-Memory · 个人记忆镜像</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>💬</text></svg>">
+    <link rel="manifest" href="static/manifest.json">
+    <link rel="apple-touch-icon" href="static/icon-192.svg">
+    <link rel="stylesheet" href="static/style.css?v=20261029-loop">
+    <link rel="stylesheet" href="static/chat-helper.css?v=20260822b">
+</head>
+<body>
+
+<!-- 网络状态 -->
+<div id="offline-banner" class="offline-banner" role="alert">
+    <span class="offline-status-dot" aria-hidden="true"></span>
+    <span class="offline-status-copy"><strong>连接已中断</strong><small>请检查网络后重试</small></span>
+    <button id="offline-retry" class="offline-retry" type="button">重试</button>
+</div>
+
+<!-- ── 登录页 ── -->
+<main id="page-auth" role="main">
+    <div class="auth-card">
+        <div class="auth-logo">
+            <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+                <path d="M26 16C18.268 16 12 21.373 12 28c0 3.866 2.064 7.308 5.312 9.68L16 42l5.2-2.8c1.8.6 3.8.94 5.8.94.68 0 1.36-.04 2.02-.12A9.5 9.5 0 0026 44c7.732 0 14-5.373 14-12S33.732 16 26 16z" fill="rgba(124,108,255,0.35)"/>
+                <circle cx="21" cy="28" r="1.8" fill="#e8e4f0"/>
+                <circle cx="26" cy="28" r="1.8" fill="#e8e4f0"/>
+                <circle cx="31" cy="28" r="1.8" fill="#e8e4f0"/>
+                <path d="M40 24c-6.627 0-12 4.477-12 10s5.373 10 12 10c1.68 0 3.28-.28 4.74-.8L52 46l-1.4-3.8C53.06 40.2 54 38.2 54 36c0-5.523-5.373-10-12-10h-2z" fill="rgba(124,108,255,0.6)"/>
+                <circle cx="36.5" cy="34" r="1.5" fill="#e8e4f0"/>
+                <circle cx="41" cy="34" r="1.5" fill="#e8e4f0"/>
+                <circle cx="45.5" cy="34" r="1.5" fill="#e8e4f0"/>
+            </svg>
+        </div>
+        <h1>ex-memory</h1>
+        <p class="subtitle">把一段记忆，变成可以对话的人</p>
+        <div class="tabs">
+            <button id="tab-login-btn" class="tab active">登录</button>
+            <button id="tab-register-btn" class="tab">注册</button>
+        </div>
+
+        <div id="form-login" class="form-box">
+            <input type="text" id="login-username" placeholder="用户名" autocomplete="username">
+            <div class="pwd-wrap">
+                <input type="password" id="login-password" placeholder="密码" autocomplete="current-password">
+                <button class="pwd-toggle" tabindex="-1" data-target="login-password" aria-label="显示密码">👁</button>
+            </div>
+            <button id="login-submit" class="btn">登录</button>
+            <p id="login-error" class="err" role="alert"></p>
+        </div>
+
+        <div id="form-register" class="form-box" style="display:none">
+            <input type="text" id="reg-username" placeholder="用户名（至少2个字符）" autocomplete="username">
+            <div class="pwd-wrap">
+                <input type="password" id="reg-password" placeholder="密码（至少6个字符）">
+                <button class="pwd-toggle" tabindex="-1" data-target="reg-password" aria-label="显示密码">👁</button>
+            </div>
+            <div class="pwd-wrap">
+                <input type="password" id="reg-password2" placeholder="再次输入密码">
+                <button class="pwd-toggle" tabindex="-1" data-target="reg-password2" aria-label="显示密码">👁</button>
+            </div>
+            <button id="reg-submit" class="btn">注册</button>
+            <p id="reg-error" class="err"></p>
+        </div>
+    </div>
+</main>
+
+<!-- ── 聊天模拟器主界面 ── -->
+<div id="page-main" style="display:none" role="application" aria-label="ex-memory 聊天应用">
+
+    <!-- ═══ 桌面端标题栏（仅桌面端可见） ═══ -->
+    <div class="desktop-titlebar">
+        <div class="titlebar-traffic">
+            <span class="traffic-light red"></span>
+            <span class="traffic-light yellow"></span>
+            <span class="traffic-light green"></span>
+        </div>
+        <span class="titlebar-app-name" id="titlebar-app-name">ex-memory</span>
+        <div class="titlebar-spacer"></div>
+    </div>
+
+    <!-- ═══ 桌面端 + 移动端主体 ═══ -->
+    <div class="app-body">
+
+        <!-- ═══ 桌面端深色侧边栏（仅桌面端可见） ═══ -->
+        <nav class="desktop-sidebar" role="navigation" aria-label="主导航">
+            <div class="sidebar-top">
+                <div class="sidebar-icon active" data-desktop-tab="chat" title="聊天" role="tab" aria-selected="true" tabindex="0">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+                </div>
+                <div class="sidebar-icon" data-desktop-tab="contacts" title="通讯录" role="tab" aria-selected="false" tabindex="-1">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                </div>
+                <div class="sidebar-icon" data-desktop-tab="discover" title="发现" role="tab" aria-selected="false" tabindex="-1">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8.56 2.75c4.37 6.03 6.02 9.42 8.03 17.72m2.54-15.38c-3.72 4.35-8.94 5.66-13.88 5.66"/></svg>
+                </div>
+            </div>
+            <div class="sidebar-bottom">
+                <div class="sidebar-icon" data-desktop-tab="me" title="我" role="tab" aria-selected="false" tabindex="-1">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                </div>
+            </div>
+        </nav>
+
+        <!-- ═══ 手机框架（移动端全屏 / 桌面端内容区） ═══ -->
+        <div class="phone-frame">
+
+            <!-- 状态栏（仅移动端可见） -->
+            <div class="phone-statusbar">
+                <span class="status-time" id="status-time">12:00</span>
+                <span class="status-icons">📶 🔋 100%</span>
+            </div>
+
+            <!-- 标题栏 -->
+            <div class="phone-navbar" id="phone-navbar">
+                <button class="nav-back" id="nav-back-btn" style="display:none" aria-label="返回">
+                    <svg width="12" height="20" viewBox="0 0 12 20" fill="none"><path d="M10 2L2 10l8 8" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <span class="nav-title" id="nav-title">ex-memory</span>
+                <button class="nav-action" id="nav-action-btn" style="display:none" aria-label="更多操作">•••</button>
+            </div>
+
+            <!-- 内容区 -->
+            <div class="phone-content" id="phone-content">
+
+                <!-- ═══ Tab 1: 聊天列表 ═══ -->
+                <div id="tab-chat-list" class="tab-page">
+                    <div class="chat-list-header">
+                        <span>消息</span>
+                    </div>
+                    <div class="search-bar">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                        <input type="text" id="search-input" placeholder="搜索镜像">
+                    </div>
+                    <div id="contact-list" class="contact-list">
+                        <p class="list-empty">暂无镜像。先导入聊天记录，再创建镜像。</p>
+                    </div>
+                </div>
+
+                <!-- ═══ 聊天详情 ═══ -->
+                <div id="tab-chat-detail" class="tab-page" style="display:none">
+                    <div id="conversation-bar" class="conversation-bar" hidden>
+                        <label for="conversation-select">会话</label>
+                        <select id="conversation-select" aria-label="选择要继续的会话"></select>
+                        <button id="conversation-refresh" type="button">刷新</button>
+                        <button id="conversation-new" type="button">新会话</button>
+                        <p id="conversation-status" role="status" aria-live="polite"></p>
+                    </div>
+                    <div class="chat-empty-hint" id="chat-empty-hint">
+                        <div class="chat-empty-icon">💬</div>
+                        <div class="chat-empty-text"><strong>还没有可对话的镜像</strong><span>导入记录 → 创建镜像，然后从左侧选择开始对话</span></div>
+                    </div>
+                    <!-- FR-021 AI 生成内容标识：常驻，不可关闭 -->
+                    <div id="ai-notice" class="msg-row sys" style="display:none">
+                        <div class="msg">以下内容由 AI 生成，不代表真实的 ta</div>
+                    </div>
+                    <div id="chat-msgs" class="chat-msgs" style="display:none" role="log" aria-live="polite" aria-label="聊天消息"></div>
+                    <div id="chat-loading" class="chat-loading" style="display:none">
+                        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+                    </div>
+                    <!-- 表情面板 -->
+                    <div id="sticker-panel" class="sticker-panel" style="display:none">
+                        <div class="sticker-tabs">
+                            <button class="sticker-tab active" data-category="all">全部</button>
+                            <button class="sticker-tab" data-category="emoji">😊 表情</button>
+                            <button class="sticker-tab" data-category="image">🖼 图片</button>
+                            <button class="sticker-tab" data-category="custom">⭐ 收藏</button>
+                        </div>
+                        <div id="sticker-grid" class="sticker-grid"></div>
+                        <button id="sticker-upload-btn" class="sticker-upload-btn" title="添加自定义表情" aria-label="上传自定义贴纸">+</button>
+                        <input type="file" id="sticker-file-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none">
+                    </div>
+                    <!-- 引用预览 -->
+                    <div id="quote-preview" class="quote-preview" style="display:none"></div>
+                    <!-- 输入栏 -->
+                    <div class="chat-input-bar" role="group" aria-label="消息输入">
+                        <button id="plus-btn" class="input-action" title="更多" aria-label="更多功能">＋</button>
+                        <button id="voice-toggle-btn" class="input-action" title="语音" aria-label="语音输入">🎤</button>
+                        <div id="voice-record-btn" class="voice-record-btn" style="display:none">
+                            <span class="voice-recording-dot"></span>
+                            按住 说话
+                        </div>
+                        <input type="text" id="msg-input" placeholder="" disabled aria-label="输入消息">
+                        <button id="sticker-toggle-btn" class="input-action" aria-label="表情">😊</button>
+                        <button id="msg-send" class="send-btn" disabled aria-label="发送消息">发送</button>
+                    </div>
+                    <!-- 图片上传（隐藏） -->
+                    <input type="file" id="image-file-input" accept="image/*" style="display:none">
+                    <!-- 更多功能面板 -->
+                    <div id="plus-panel" class="plus-panel" style="display:none">
+                        <div class="plus-panel-item" onclick="document.getElementById('image-file-input').click()">
+                            <div class="plus-panel-icon">🖼</div>
+                            <div class="plus-panel-label">图片</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ═══ Tab 2: 通讯录 ═══ -->
+                <div id="tab-contacts" class="tab-page" style="display:none">
+                    <div class="contacts-header">通讯录</div>
+                    <div id="contact-profile" class="contact-profile">
+                        <p class="list-empty">请先在聊天列表选择镜像</p>
+                    </div>
+                </div>
+
+                <!-- ═══ Tab 3: 发现 ═══ -->
+                <div id="tab-discover" class="tab-page" style="display:none">
+                    <header class="discover-hero">
+                        <span class="discover-eyebrow">EXPLORE</span>
+                        <h1>发现</h1>
+                        <p>浏览记忆动态，或在本机安全整理你的聊天。</p>
+                    </header>
+                    <div class="discover-feature-grid">
+                        <button class="discover-feature-card" id="moments-entry" type="button" aria-expanded="false" aria-controls="moments-timeline">
+                            <span class="discover-feature-icon" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none"><path d="M4 7.5h16M7.5 4v16M16.5 4v16M4 16.5h16"/><rect x="3" y="3" width="18" height="18" rx="5"/></svg>
+                            </span>
+                            <span class="discover-feature-copy"><strong>朋友圈</strong><small>查看镜像留下的动态与片段</small></span>
+                            <span class="discover-feature-side"><span class="discover-feature-tag">记忆动态</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m7 4 6 6-6 6"/></svg></span>
+                        </button>
+                        <button class="discover-feature-card" id="chat-helper-entry" type="button" aria-expanded="false" aria-controls="chat-helper-panel">
+                            <span class="discover-feature-icon export" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" fill="none"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 14v4a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3v-4"/></svg>
+                            </span>
+                            <span class="discover-feature-copy"><strong>聊天导出</strong><small>离线生成完整 HTML 与分类媒体</small></span>
+                            <span class="discover-feature-side"><span class="discover-feature-tag private">本机工具</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="m7 4 6 6-6 6"/></svg></span>
+                        </button>
+                    </div>
+                    <section id="chat-helper-panel" class="chat-helper-panel" style="display:none" aria-label="聊天导出">
+                        <div class="chat-helper-workspace">
+                            <header class="chat-helper-header">
+                                <div><span class="chat-helper-kicker">LOCAL EXPORT</span><h2>本机聊天 4.1.12 导出</h2><p>聊天正文、联系人、媒体和数据库密钥只在你的 Mac 上处理，不上传到本站。</p></div>
+                                <span class="chat-helper-private"><span aria-hidden="true"></span>仅在本机处理</span>
+                            </header>
+                            <div id="chat-helper-state" class="chat-helper-state" role="status" aria-live="polite">尚未检测本地助手</div>
+                            <div class="chat-helper-actions">
+                                <button id="chat-helper-launch" class="chat-helper-launch" type="button">检测并启动本地助手<span aria-hidden="true">→</span></button>
+                                <a id="chat-helper-open" class="chat-helper-open" href="#" style="display:none">重新打开本地安全页面<span aria-hidden="true">→</span></a>
+                                <button id="chat-helper-skip" class="chat-helper-skip" type="button">已有导出文件？直接导入</button>
+                            </div>
+                            <div class="chat-helper-steps" aria-label="导出流程">
+                                <div><span>01</span><strong>连接助手</strong><small>只连接本机 localhost</small></div>
+                                <div><span>02</span><strong>本机解密</strong><small>聊天数据不上传</small></div>
+                                <div><span>03</span><strong>生成 HTML</strong><small>媒体按类别存放</small></div>
+                            </div>
+                            <aside class="chat-helper-beta"><span class="chat-helper-beta-icon" aria-hidden="true">β</span><div><strong>未签名开源 Beta · 仅验证聊天 4.1.12</strong><p>每个聊天账号的数据库密钥不同，首次导入、切换账号、助手重启、聊天升级或密钥验证失败时都要重新提取。流程会临时关闭 SIP；生成解密快照后必须立即重新开启，随后才能导出。</p></div></aside>
+                            <div id="chat-helper-downloads" class="chat-helper-downloads" style="display:none"></div>
+                        </div>
+                    </section>
+                    <!-- 朋友圈时间线 -->
+                    <div id="moments-timeline" class="moments-timeline" style="display:none">
+                        <div id="moments-list"></div>
+                    </div>
+                </div>
+
+                <!-- ═══ Tab 4: 我 ═══ -->
+                <div id="tab-me" class="tab-page" style="display:none">
+                    <div class="me-header">
+                        <div class="me-avatar">🧑</div>
+                        <div class="me-name" id="me-username">我</div>
+                    </div>
+                    <div class="me-menu">
+                        <div class="me-item">
+                            <span>🌓 外观</span>
+                            <select id="theme-select" class="theme-select">
+                                <option value="auto">跟随系统</option>
+                                <option value="light">浅色</option>
+                                <option value="dark">深色</option>
+                            </select>
+                        </div>
+                        <div class="me-item">
+                            <span>🔤 字体大小</span>
+                            <select id="font-size-select" class="theme-select">
+                                <option value="small">小</option>
+                                <option value="normal">标准</option>
+                                <option value="large">大</option>
+                                <option value="xlarge">特大</option>
+                            </select>
+                        </div>
+                        <div class="me-item" id="wallet-entry">
+                            <span>💰 钱包</span>
+                            <span class="discover-arrow">›</span>
+                        </div>
+                        <div class="me-item" id="model-settings-entry" role="button" tabindex="0">
+                            <span>🔑 模型设置</span><span class="discover-arrow">›</span>
+                        </div>
+                        <div class="me-item" id="create-entry" role="button" tabindex="0">
+                            <span>➕ 创建新镜像</span>
+                            <span class="discover-arrow">›</span>
+                        </div>
+                        <div class="me-item" id="logout-entry">
+                            <span>🚪 退出登录</span>
+                            <span class="discover-arrow">›</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ═══ 钱包 ═══ -->
+                <div id="tab-wallet" class="tab-page" style="display:none">
+                    <div class="wallet-header">
+                        <div class="wallet-balance-label">零钱</div>
+                        <div class="wallet-balance" id="wallet-balance">¥ 0.00</div>
+                    </div>
+                    <div class="wallet-actions">
+                        <button class="wallet-action-btn" id="wallet-redpacket-btn">🧧 红包记录</button>
+                        <button class="wallet-action-btn" id="wallet-transfer-btn">💸 转账记录</button>
+                    </div>
+                    <div class="wallet-tx-list" id="wallet-tx-list">
+                        <p class="list-empty">暂无交易记录</p>
+                    </div>
+                </div>
+
+                <div id="tab-models" class="tab-page" style="display:none">
+                    <div class="create-container">
+                        <h2>当前账号的模型设置</h2>
+                        <p class="import-intro">使用你自己的服务商账户，模型调用费用由该账户承担。对话和 Embedding 可选不同服务；同一平台的 Key 也需分别填写。</p>
+                        <div class="create-form" id="model-settings-form">
+                            <p class="import-intro" id="model-settings-status" role="status">正在读取当前账号配置…</p>
+                            <fieldset class="model-settings-group">
+                                <legend>对话模型</legend>
+                                <label for="settings-llm-provider">服务商</label>
+                                <select id="settings-llm-provider"><option value="deepseek">DeepSeek</option><option value="siliconflow">SiliconFlow</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic / Claude（Messages）</option><option value="gemini">Google Gemini（原生接口）</option><option value="custom">自定义 · OpenAI 兼容</option><option value="custom_anthropic">自定义 · Anthropic Messages</option><option value="custom_gemini">自定义 · Gemini 原生接口</option></select>
+                                <p id="settings-llm-protocol-hint" class="file-hint" hidden>Anthropic 请使用绑定 workspace 的 API Key。</p>
+                                <div id="settings-llm-url-row" hidden>
+                                    <label for="settings-llm-base-url">公网 HTTPS API 地址</label>
+                                    <input type="url" id="settings-llm-base-url" placeholder="https://api.example.com/v1" autocomplete="off" maxlength="2048">
+                                    <p id="settings-llm-url-hint" class="file-hint">填写所选协议的基础地址。</p>
+                                </div>
+                                <label for="settings-llm-model">模型名称</label>
+                                <input type="text" id="settings-llm-model" placeholder="填写服务商提供的模型名称" autocomplete="off" maxlength="128">
+                                <label for="settings-llm-key">API Key</label>
+                                <input type="password" id="settings-llm-key" placeholder="首次填写；留空保留已保存的 Key" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="4096">
+                                <p id="settings-llm-key-status" class="file-hint">尚未读取配置</p>
+                                <label class="import-consent"><input type="checkbox" id="settings-llm-delete"><span>删除已保存的对话模型 Key</span></label>
+                                <p id="settings-llm-locked" class="file-hint" hidden></p>
+                            </fieldset>
+                            <fieldset class="model-settings-group">
+                                <legend>Embedding 模型</legend>
+                                <label for="settings-embedding-provider">服务商</label>
+                                <select id="settings-embedding-provider"><option value="siliconflow">SiliconFlow</option><option value="openai">OpenAI</option><option value="gemini">Google Gemini（原生接口）</option><option value="custom">自定义 · OpenAI 兼容</option><option value="custom_gemini">自定义 · Gemini 原生接口</option></select>
+                                <p class="file-hint">Anthropic Messages 不提供 Embedding；可与其他服务商的 Embedding 搭配。</p>
+                                <p id="settings-embedding-protocol-hint" class="file-hint" hidden>Gemini 原生 Embedding 使用 1024 维，请选择支持该维数的模型。</p>
+                                <div id="settings-embedding-url-row" hidden>
+                                    <label for="settings-embedding-base-url">公网 HTTPS API 地址</label>
+                                    <input type="url" id="settings-embedding-base-url" placeholder="https://api.example.com/v1" autocomplete="off" maxlength="2048">
+                                    <p id="settings-embedding-url-hint" class="file-hint">填写所选协议的基础地址。</p>
+                                </div>
+                                <label for="settings-embedding-model">模型名称</label>
+                                <input type="text" id="settings-embedding-model" placeholder="填写服务商提供的模型名称" autocomplete="off" maxlength="128">
+                                <label for="settings-embedding-key">API Key</label>
+                                <input type="password" id="settings-embedding-key" placeholder="首次填写；留空保留已保存的 Key" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="4096">
+                                <p id="settings-embedding-key-status" class="file-hint">尚未读取配置</p>
+                                <label class="import-consent"><input type="checkbox" id="settings-embedding-delete"><span>删除已保存的Embedding 模型 Key</span></label>
+                                <p id="settings-embedding-locked" class="file-hint" hidden></p>
+                            </fieldset>
+                            <p class="import-intro">自定义地址需使用公网 HTTPS，不支持本机、内网或地址跳转。Key 会在服务器加密保存，读取时仅显示配置状态和末 4 位。必要的聊天内容及对应 Key 只发送至你选择的接口。请勿填写其他人的 Key。</p>
+                            <button class="btn" id="model-settings-save" type="button" disabled>保存当前账号配置</button>
+                            <button class="import-link" id="model-settings-reload" type="button">重新读取配置</button>
+                            <p class="err" id="model-settings-result" role="status" aria-live="polite"></p>
+                            <button class="btn" id="model-settings-continue" type="button" hidden>配置完成，继续导入</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ═══ 创建镜像 ═══ -->
+                <div id="tab-create" class="tab-page" style="display:none">
+                    <div class="create-container">
+                        <h2>从聊天记录创建个人记忆镜像</h2>
+                        <p class="import-intro">选择记录、确认说话人，再生成镜像。回复是基于记录的 AI 模拟。</p>
+                        <div class="create-form">
+                            <p id="import-config-status" class="import-intro" role="status">正在读取导入说明…</p>
+                            <button id="import-config-retry" class="import-link" type="button" hidden>重新读取说明</button>
+                            <button id="import-model-settings" class="import-link" type="button" hidden>配置我的模型</button>
+                            <label for="create-file">1. 选择聊天记录 *</label>
+                            <div class="file-upload">
+                                <input type="file" id="create-file" accept=".txt,.json,.jsonl,.csv,.mht,.mhtml" aria-describedby="import-format-hint">
+                                <span class="file-name" id="create-file-name">未选择文件</span>
+                            </div>
+                            <p id="import-format-hint" class="file-hint">选择受支持的聊天或 QQ 导出文件。HTML、数据库和压缩包需先转换。</p>
+                            <a id="import-sample" class="import-link" href="static/import-example.json" download="ex-memory-fictional-example.json">下载虚构示例，先体验完整流程</a>
+                            <p class="file-hint">示例中目标说话人是“小雨”，可以问“周六约在哪里？”。全部人物与对话均为虚构。</p>
+                            <label for="create-name">2. 镜像名称 *</label>
+                            <input type="text" id="create-name" placeholder="例如：小雨的记忆" maxlength="64" autocomplete="off">
+                            <label for="create-target">记录中的目标说话人 *</label>
+                            <input type="text" id="create-target" placeholder="填写聊天记录里的昵称，例如：小雨" maxlength="128" autocomplete="off">
+                            <p class="file-hint">用于区分双方发言，可以与上面的镜像名称不同。</p>
+                            <label for="create-basic">背景补充（可选）</label>
+                            <textarea id="create-basic" rows="2" placeholder="你希望保留的背景，例如认识的时间、共同经历…"></textarea>
+                            <label for="create-personality">表达习惯补充（可选）</label>
+                            <textarea id="create-personality" rows="2" placeholder="例如常用的词、句子长度；导入后也可在对话中纠正"></textarea>
+                            <div class="import-privacy" id="import-privacy">
+                                <strong>3. 确认资料与处理方式</strong>
+                                <p>上传后，当前 Ex-Memory 服务会保存处理后的记录、人物记忆和对话；必要的记录片段会发送给你在当前账号配置的向量与对话模型提供方。网站在线体验在服务器处理，本机聊天导出仅负责在电脑上取得文件。</p>
+                                <p>请先移除不希望上传的内容。可在镜像菜单导出资料或删除镜像。</p>
+                                <label class="import-consent"><input type="checkbox" id="create-consent"><span>我已阅读处理说明，并确认拥有处理这份本人或获授权聊天记录的依据。</span></label>
+                            </div>
+                            <button id="create-submit" class="btn" disabled>导入并创建镜像</button>
+                            <p id="create-result" class="err" role="status" aria-live="polite"></p>
+                            <button id="create-open" class="btn" type="button" hidden>开始对话</button>
+                            <button id="create-another" class="import-link" type="button" hidden>新建另一个镜像</button>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- 底部导航（仅移动端可见） -->
+            <nav class="phone-tabbar" role="tablist" aria-label="底部导航">
+                <button class="tabbar-btn active" data-tab="chat-list" role="tab" aria-selected="true">
+                    <span class="tabbar-icon">💬</span>
+                    <span class="tabbar-label">聊天</span>
+                </button>
+                <button class="tabbar-btn" data-tab="contacts" role="tab" aria-selected="false">
+                    <span class="tabbar-icon">👤</span>
+                    <span class="tabbar-label">通讯录</span>
+                </button>
+                <button class="tabbar-btn" data-tab="discover" role="tab" aria-selected="false">
+                    <span class="tabbar-icon">🔍</span>
+                    <span class="tabbar-label">发现</span>
+                </button>
+                <button class="tabbar-btn" data-tab="me" role="tab" aria-selected="false">
+                    <span class="tabbar-icon">👤</span>
+                    <span class="tabbar-label">我</span>
+                </button>
+            </nav>
+        </div>
+    </div>
+
+    <!-- 红包开启动画覆盖层 -->
+    <div id="redpacket-overlay" class="redpacket-overlay" style="display:none" role="dialog" aria-modal="true" aria-label="红包">
+        <div class="redpacket-card" id="redpacket-card">
+            <div class="redpacket-top">
+                <div class="redpacket-icon">🧧</div>
+                <div class="redpacket-sender" id="rp-sender">ta</div>
+                <div class="redpacket-note" id="rp-note">给你的</div>
+            </div>
+            <div class="redpacket-bottom" id="redpacket-bottom">
+                <button class="redpacket-open-btn" id="rp-open-btn">開</button>
+            </div>
+            <div class="redpacket-result" id="redpacket-result" style="display:none">
+                <div class="redpacket-amount" id="rp-amount">¥ 0.00</div>
+                <div class="redpacket-done-note" id="rp-done-note"></div>
+                <button class="redpacket-close-btn" id="rp-close-btn">收下</button>
+            </div>
+            <div id="coins-container" class="coins-container"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Action Sheet -->
+<div id="action-sheet-overlay" class="action-sheet-overlay" style="display:none">
+    <div class="action-sheet" id="action-sheet">
+        <div class="action-sheet-options" id="action-sheet-options"></div>
+        <button class="action-sheet-cancel" id="action-sheet-cancel">取消</button>
+    </div>
+</div>
+
+<!-- 确认弹窗 -->
+<div id="confirm-overlay" class="action-sheet-overlay" style="display:none">
+    <div class="confirm-dialog" id="confirm-dialog">
+        <div class="confirm-title" id="confirm-title"></div>
+        <div class="confirm-message" id="confirm-message"></div>
+        <div class="confirm-actions">
+            <button class="confirm-btn cancel" id="confirm-cancel-btn">取消</button>
+            <button class="confirm-btn danger" id="confirm-ok-btn">确认</button>
+        </div>
+    </div>
+</div>
+
+<dialog id="correction-dialog" class="correction-dialog" aria-labelledby="correction-title">
+    <form id="correction-form">
+        <h2 id="correction-title">纠正这条回答</h2>
+        <p>写清希望记住的事实或表达习惯。保存后用于这个镜像的后续回答，包含其他会话。</p>
+        <blockquote id="correction-answer"></blockquote>
+        <blockquote id="correction-source" hidden></blockquote>
+        <label for="correction-content">纠正内容</label>
+        <textarea id="correction-content" maxlength="500" rows="4" required placeholder="例如：他不使用这个称呼，请直接叫我的名字。"></textarea>
+        <p id="correction-result" role="status" aria-live="polite"></p>
+        <div class="correction-actions">
+            <button id="correction-cancel" type="button">取消</button>
+            <button id="correction-save" type="submit">保存纠正</button>
+        </div>
+    </form>
+</dialog>
+
+<script src="static/effects.js"></script>
+<script src="static/import-flow.js?v=20261024-byok"></script>
+<script src="static/model-settings.js?v=20261024-protocols"></script>
+<script src="static/memory-loop.js?v=20261029-loop"></script>
+<script src="static/app.js?v=20261029-loop"></script>
+<script src="static/chat-helper.js?v=20260824c"></script>
+</body>
+</html>

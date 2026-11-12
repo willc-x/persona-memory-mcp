@@ -1,0 +1,5 @@
+# 在独立虚拟环境中安装；不要覆盖系统或全局 Python。
+# 本地后端、离线 embedding 与 stdio MCP 使用经过审查的固定版本。
+-r config/requirements-local.txt
+# 不引用上游 requirements-mcp.txt：它会重新钉另一套 uvicorn。
+mcp>=1.10,<2

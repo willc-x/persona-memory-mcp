@@ -1,0 +1,13 @@
+{
+  "service_name": "YOUR_PROVIDER",
+  "base_url": "https://YOUR_PROVIDER.example/v1",
+  "model": "YOUR_MODEL",
+  "context_tokens": 16000,
+  "request_timeout_seconds": 120,
+  "billing_mode": "priced",
+  "api_key_env": "CHAT_LLM_API_KEY",
+  "prices": {
+    "input_rmb_per_million": null,
+    "output_rmb_per_million": null
+  }
+}

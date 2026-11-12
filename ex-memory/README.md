@@ -1,0 +1,412 @@
+# ex-memory — 前任记忆智能体
+
+> 把一段记忆，变成可以对话的人。
+
+[![CI](https://github.com/Meteorkid/ex-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Meteorkid/ex-memory/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-v0.3.0-blue.svg)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/python-3.10+-green.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
+
+ex-memory 是一个开源的数字镜像系统，通过分析你和前任的聊天记录，生成一个能还原 ta 语气、性格和表达习惯的 AI 对话体。支持聊天、QQ 聊天记录导入，内置 RAG 检索增强、三层记忆架构、关系反思分析，以及一个仿聊天 Web 界面。
+
+> 下载 · 文档 · 更新：<https://www.imagentx.top/zh/products/ex-memory>
+
+## 核心特性
+
+- **语气还原**：原话优先于描述 —— 从聊天记录中提取 ta 的真实表达作为语气锚点
+- **RAG 检索增强**：每轮对话前自动检索向量库，找到 ta 在类似场景下说过的话
+- **三层记忆架构**：潜意识层（向量库原话） > 记忆层（memory.md） > 人格层（persona.md）
+- **关系反思**：7 维度深度分析，生成 reflections.md
+- **纠正机制**：对话中说"ta不会这样"即可即时修正
+- **聊天模拟器**：仿聊天 Web 界面，支持贴纸、红包、转账、朋友圈
+- **聊天记录导出**：支持本机 iTunes/iOS 备份导出聊天记录
+- **Emo 忧郁风格 UI**：午夜独白设计语言，深紫黑底色 + 薰衣草紫强调 + 动态呼吸光晕
+- **聊天风格登录页**：双气泡 Logo + 底部边框输入 + 聊天绿按钮
+- **纯 Python CLI**：不依赖 Claude，可独立运行
+
+## 效果评测（Evals）
+
+RAG 链路配有一套可复现的量化评测体系（[`evals/`](evals/)，指标全部手写实现，不依赖评测框架）：147 条查询 × 49 个事实簇的 Golden Dataset（消息级 ground truth，合成聊天风格语料，隐私数据不进仓库），检索端 Recall@K / MRR / nDCG@K，生成端忠实度 / 幻觉率（LLM judge 论断级判定）。
+
+| 指标（bge-m3 + ChromaDB + deepseek-chat 实测） | 结果 |
+|---|---|
+| 检索 Recall@5（最优分块 3轮/重叠1） | **91.5%**（当前生产配置 71.1%，MRR 0.826） |
+| 生成幻觉率：RAG vs 无 RAG 基线 | **17.9% vs 94.5%** |
+| 生成忠实度（论断被检索上下文支持的比例） | 85.9% |
+
+关键发现：分块窗口大小与 `dominant_speaker=target` 过滤强耦合——窗口越大越难有单一说话人过半，8 轮窗口下候选池枯竭、Recall@5 崩至 21.1%；另外 `RAG_THRESHOLD=0.3` 在 bge-m3 的分数分布下几乎不起过滤作用，真正的召回拐点在 0.5。
+
+完整报告（图表、阈值扫描、dominant_speaker 过滤代价、失败案例分析）：[docs/eval_report.md](docs/eval_report.md)
+
+```bash
+make eval-corpus      # 重新生成语料与 Golden Dataset（固定种子，确定性）
+make eval-retrieval   # 检索 A/B：分块 × 过滤 × 阈值（需 EMBEDDING_API_KEY，或 --mock 冒烟）
+make eval-generation  # 生成评测：忠实度/幻觉率（需 LLM_API_KEY，默认抽样 60 条控制成本）
+make eval-report      # 生成图表与 docs/eval_report.md
+```
+
+## 快速开始
+
+### 环境要求
+
+- Python 3.10+
+- macOS / Linux / Windows
+
+### 安装
+
+```bash
+git clone https://github.com/yourname/ex-memory.git
+cd ex-memory
+pip install -r requirements.txt
+```
+
+### 配置 API
+
+复制示例配置并填入你的 API Key：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`：
+
+```env
+# LLM（必填）
+LLM_API_KEY=your_api_key_here
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+
+# Embedding（可选，不配则 RAG 不可用）
+EMBEDDING_API_KEY=your_api_key_here
+EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+EMBEDDING_MODEL=BAAI/bge-m3
+```
+
+支持任意 OpenAI 兼容端点（硅基流动、DeepSeek、OpenAI 等）。也可将 Key 存入 macOS Keychain：
+
+```bash
+python run.py
+> /keychain set llm sk-xxx
+```
+
+### 启动
+
+**CLI 模式：**
+```bash
+python run.py
+```
+
+**Web API 服务：**
+```bash
+python -m server.app
+```
+默认启动在 `http://localhost:8000`，提供 REST API 和静态 Web 前端。
+
+**Gradio Web 界面：**
+```bash
+python run.py
+> /web
+```
+
+## 使用指南
+
+### 创建镜像
+
+```
+> /create
+```
+
+按提示输入：
+1. 镜像代号（如 `xiaoming`）
+2. 基本信息（在一起多久、分手多久、ta 的职业等）
+3. 选择数据源（聊天/QQ 聊天记录、口述、截图）
+
+系统自动完成：解析 → 切片 → 入库 → LLM 生成 persona.md + memory.md → 合并 SKILL.md
+
+### 对话
+
+```
+> /xiaoming
+```
+
+进入对话模式。每轮对话前系统会自动检索向量库，找到 ta 在类似场景下的原话作为语气参考。
+
+### 追加素材
+
+```
+> /update xiaoming
+```
+
+向已有镜像追加新的聊天记录或口述内容，自动增量合并。
+
+### 关系反思
+
+```
+> /reflect xiaoming
+```
+
+从 7 个维度分析这段关系，生成反思报告。
+
+### 版本管理
+
+```
+> /backup xiaoming          # 备份当前版本
+> /rollback xiaoming v1     # 回滚到指定版本
+> /let-go xiaoming          # 删除镜像（不可逆）
+```
+
+## 命令参考
+
+| 命令 | 说明 |
+|------|------|
+| `/create` | 创建新的记忆镜像 |
+| `/{名称}` | 进入已有镜像的对话模式 |
+| `/list` | 列出所有镜像 |
+| `/update {名称}` | 向已有镜像追加新素材 |
+| `/reflect {名称}` | 关系反思分析 |
+| `/backup {名称}` | 备份镜像版本 |
+| `/rollback {名称} {版本}` | 回滚到指定版本 |
+| `/let-go {名称}` | 删除镜像（不可逆） |
+| `/export {名称}` | 导出镜像对话记录 |
+| `/keychain` | 管理 API Key（macOS Keychain） |
+| `/web` | 启动 Gradio Web 界面 |
+| `/help` | 显示帮助 |
+| `/exit` | 退出 |
+
+## 项目结构
+
+```
+ex-memory/
+├── run.py                    # CLI 主入口
+├── config.py                 # 全局配置
+├── requirements.txt
+├── .env.example
+│
+├── core/
+│   ├── engine.py             # ChatEngine：SKILL.md + RAG → API 调用
+│   ├── session.py            # ChatSession：CLI 循环、指令分发
+│   ├── token_counter.py      # Token 统计
+│   ├── sticker_selector.py   # 情绪贴纸选择器
+│   ├── validation.py         # 输入校验 + 注入检测
+│   ├── version_manager.py    # 版本备份/回滚
+│   ├── wallet_manager.py     # 红包/转账系统
+│   ├── keychain.py           # macOS Keychain 集成
+│   ├── conversation_store.py # 对话存储管理
+│   ├── exe_lifecycle.py      # 镜像生命周期管理
+│   ├── exe_access.py         # 镜像访问控制
+│   ├── exporters/            # 导出适配器
+│   │   ├── conversation.py   # 对话导出
+│   └── chat_export/        # 聊天导出模块
+│       ├── backups.py        # iTunes 备份扫描
+│       ├── security.py       # 导出安全控制
+│       └── tasks.py          # 导出任务管理
+│
+├── memory/
+│   ├── vector_store.py       # ChromaDB 封装
+│   ├── chunker.py            # 聊天记录切片
+│   ├── embedder.py           # Embedding API 封装
+│   └── ingest.py             # 数据摄入入口
+│
+├── pipeline/
+│   ├── orchestrator.py       # 创建/更新流程总调度
+│   ├── persona_builder.py    # LLM 生成 persona.md
+│   ├── memory_builder.py     # LLM 生成 memory.md
+│   ├── skill_combiner.py     # 合并 SKILL.md
+│   ├── correction_handler.py # 对话纠正
+│   ├── merger.py             # 增量合并
+│   └── reflector.py          # 关系反思
+│
+├── parsers/
+│   ├── chat_parser.py      # 聊天记录解析
+│   └── qq_parser.py          # QQ 聊天记录解析
+│
+├── commands/                 # CLI 命令模块
+│   ├── create.py / chat.py / update.py / ...
+│   ├── export.py             # 导出命令
+│   └── __init__.py           # 命令注册表
+│
+├── server/
+│   ├── app.py                # FastAPI 应用
+│   ├── routes.py             # API 路由
+│   ├── auth.py               # 用户认证
+│   └── middleware.py         # 中间件
+│
+├── web/
+│   ├── app.py                # Gradio Web 界面
+│   └── static/               # 聊天模拟器 SPA
+│
+├── prompts/                  # LLM prompt 模板
+├── evals/                    # RAG 评测：Golden Dataset + 手写指标 + A/B Runner
+├── tests/                    # 测试套件
+│
+└── exes/{slug}/              # 运行时数据
+    ├── SKILL.md              # 合并版运行 prompt
+    ├── memory.md             # 记忆层
+    ├── persona.md            # 人格层（含原话语料库）
+    ├── reflections.md        # 关系反思
+    ├── corrections.md        # 纠正记录
+    ├── meta.json             # 元信息
+    ├── chroma_db/            # ChromaDB 持久化
+    ├── sessions/             # 对话归档
+    └── versions/             # 版本快照
+```
+
+## API 端点
+
+Web API 服务提供以下端点（`http://localhost:8000/api`）：
+
+### 认证
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/auth/register` | 注册 |
+| POST | `/auth/login` | 登录 |
+| POST | `/auth/logout` | 登出 |
+
+### 镜像管理
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/exes` | 列出所有镜像 |
+| POST | `/exes` | 创建镜像 |
+| GET | `/exes/{slug}/export` | 导出镜像数据 zip |
+| DELETE | `/exes/{slug}` | 彻底删除镜像数据 |
+| GET | `/exes/{slug}/conversations/export?format=html` | 导出 ex-memory 对话记录（html/md/json/txt） |
+| POST | `/exes/{slug}/import` | 导入聊天记录（自动检测聊天/QQ） |
+| POST | `/exes/{slug}/update` | 追加素材 |
+| POST | `/exes/{slug}/reflect` | 关系反思 |
+
+### 对话
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/chat` | 普通对话（非流式） |
+| POST | `/chat/stream` | 流式对话（SSE） |
+| GET | `/exes/{slug}/usage` | 获取 token 累计消耗 |
+
+### 钱包 / 红包 / 转账
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/exes/{slug}/wallet` | 钱包信息 |
+| POST | `/exes/{slug}/redpacket/send` | 发红包 |
+| POST | `/exes/{slug}/redpacket/{id}/open` | 开红包 |
+| POST | `/exes/{slug}/transfer/send` | 转账 |
+| POST | `/exes/{slug}/transfer/{id}/confirm` | 确认收款 |
+
+### 朋友圈
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/exes/{slug}/moments` | 朋友圈动态 |
+
+### 本机聊天导出
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/chat-export/status` | 查看本机聊天导出环境 |
+| GET | `/chat-export/backups` | 扫描固定 iTunes/iOS 备份目录 |
+| GET | `/chat-export/tasks/{task_id}` | 查询导出任务状态 |
+| GET | `/chat-export/tasks/{task_id}/files/{path}` | 下载任务输出文件 |
+
+## 配置说明
+
+通过 `.env` 文件配置，支持以下变量：
+
+| 变量 | 必填 | 说明 | 默认值 |
+|------|------|------|--------|
+| `LLM_API_KEY` | 是 | LLM API Key | — |
+| `LLM_BASE_URL` | 否 | API 端点 | `https://api.deepseek.com` |
+| `LLM_MODEL` | 否 | 模型名称 | `deepseek-chat` |
+| `LLM_TEMPERATURE` | 否 | 生成温度 | `0.8` |
+| `EMBEDDING_API_KEY` | 否 | Embedding API Key | — |
+| `EMBEDDING_BASE_URL` | 否 | Embedding 端点 | `https://api.siliconflow.cn/v1` |
+| `EMBEDDING_MODEL` | 否 | Embedding 模型 | `BAAI/bge-m3` |
+| `LOCAL_CHAT_EXPORT_ENABLED` | 否 | 启用网页本机聊天导出向导 | `false` |
+| `CHAT_EXPORT_BACKUP_ROOT` | 否 | iTunes/iOS 备份扫描根目录 | `~/Library/Application Support/MobileSync/Backup` |
+| `CHAT_EXPORT_OUTPUT_DIR` | 否 | 聊天导出任务输出目录 | `data/chat_exports` |
+| `LOCAL_CHAT_HELPER_ENABLED` | 否 | 展示仅验证聊天 4.1.12 的 macOS 本地助手下载入口 | `false` |
+| `LOCAL_CHAT_HELPER_VERSION` | 否 | 本站发布的本地助手版本 | — |
+| `LOCAL_CHAT_HELPER_MIN_API_VERSION` | 否 | 网站接受的本地助手最低 API 协议版本 | `1` |
+| `LOCAL_CHAT_HELPER_ARM64_URL` | 否 | 自有网站上的 arm64 DMG HTTPS 地址 | — |
+| `LOCAL_CHAT_HELPER_ARM64_SHA256` | 否 | arm64 DMG 的 SHA-256 | — |
+
+未配置 Embedding 时 RAG 检索不可用，但对话仍可正常进行（退化为纯文本模式）。
+
+## 支持的聊天记录格式
+
+### 聊天
+- WeFlow 导出（JSON / JSONL）
+- ChatMsg 导出（TXT）
+- 留痕导出（JSON）
+
+### QQ
+- QQ 导出 TXT（时间戳 + 昵称 + QQ 号格式）
+- MHT 格式（beta）
+
+## 隐私说明
+
+- 镜像数据存储在本地 `exes/` 目录，自定义贴纸存储在 `data/stickers/custom/`
+- 聊天记录仅用于生成记忆镜像，不会用于其他目的
+- 用户可通过 `GET /api/exes/{slug}/export` 导出单个镜像数据，通过 `DELETE /api/exes/{slug}` 彻底删除镜像目录
+- Web/API 对话会归档到 `exes/{slug}/conversations/conversation.jsonl`，可通过对话导出接口生成 HTML/Markdown/JSON/TXT
+- 聊天导出任务输出存放在 `data/chat_exports/`，只通过鉴权和本机限制的 API 下载
+- API Key 可存储在 macOS Keychain 中，避免明文写入配置文件
+- 建议将 `exes/`、`data/`、`.coverage` 等运行时数据加入 `.gitignore`
+
+## 部署
+
+### Docker 部署
+
+```bash
+# 拉取镜像
+docker pull ghcr.io/Meteorkid/ex-memory:latest
+
+# 运行
+docker run -d -p 8000:8000 -p 7860:7860 --env-file .env ghcr.io/Meteorkid/ex-memory:latest
+```
+
+### Docker Compose 部署
+
+```bash
+docker compose up -d
+```
+
+### 自动部署
+
+推送到 `main` 分支自动运行 CI（测试 + lint）。打 tag 时自动构建 Docker 镜像并发布到 GitHub Container Registry：
+
+```bash
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+镜像地址：`ghcr.io/Meteorkid/ex-memory:v0.4.0`
+
+## 更新日志
+
+详见 [CHANGELOG.md](CHANGELOG.md)。
+
+### v0.3.0 (2026-05-29)
+
+- **聊天记录导出**：支持本机 iTunes/iOS 备份导出聊天记录
+- **Emo 忧郁风格 UI**：全新「午夜独白」设计语言，深紫黑底色 + 薰衣草紫强调 + 动态呼吸光晕 + 漂浮粒子动画
+- **聊天风格登录页**：双气泡 Logo + 底部边框输入 + 聊天绿按钮
+- **安全加固**：CORS 限制、X-Forwarded-For IP 白名单、移除明文 token 兼容
+- **Bug 修复**：routes.py 变量未定义、红包/转账 ID UUID 防碰撞、init_db 启动时机
+- **性能优化**：chat_stream 重试、session 摘要截断策略、sticker_manager 缓存
+- **测试补充**：新增 orchestrator/routes_chat/engine_integration 三组测试（24 用例）
+- **JS 修复**：voiceBtn 重复声明导致登录失败、speechRecognition TDZ 问题
+
+### v0.2.0 (2026-05-13)
+
+- QQ 聊天记录解析器（3 种 TXT 格式 + MHT beta）
+- Session LLM 语义摘要 + ChromaDB 备份/恢复
+- API Token 累计计数（`GET /api/exes/{slug}/usage`）
+- run.py 拆分为 `commands/` 注册表模式（-81%）
+- Gradio 多用户状态 + 流式对话 + 贴纸/Token 显示
+- API 异步化 + 引擎缓存 + 多项 bug 修复
+
+### v0.1.0 (2026-05-12)
+
+- 初始版本：三层记忆架构、RAG 检索增强、聊天解析、全自动蒸馏流水线
+- 对话引擎、关系反思、纠正机制、版本管理
+- 聊天模拟器 Web 界面 + FastAPI 服务端 + CLI
+
+## 许可证
+
+MIT License

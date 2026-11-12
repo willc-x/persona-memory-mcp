@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "authorization_note": "只将以下示例保存为数据目录 config/privacy-consent.json 后按实际服务和用户确认修改；不得将placeholder视为授权。",
+  "authorizations": [
+    {
+      "id": "TRIAL_GRANT_ID",
+      "purposes": ["distill_trial"],
+      "service": "HOST",
+      "allowed_base_url": "HOST",
+      "allowed_model": "MODEL",
+      "provider_fingerprint": "COMPUTE_WITH_CONFIGURE_COMMAND",
+      "source_sha256": "SOURCE_SHA256",
+      "plan_hash": "PLAN_HASH",
+      "max_calls": 6,
+      "max_cost_rmb": null,
+      "billing_mode": "usage_only",
+      "route_usage_confirmed": false,
+      "privacy_confirmed": false,
+      "confirmed_by_user": false,
+      "scope": "仅指定训练段；不包含holdout"
+    }
+  ]
+}

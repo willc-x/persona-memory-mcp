@@ -1,0 +1,29 @@
+# 本机部署锁：基于 ex-memory/requirements.lock。
+# 上游 uvicorn 0.54 [standard] 的 websockets>=13 与 Gradio4 的 <13 冲突。
+# uvicorn0.34.3满足上游>=0.31.1且与Gradio4兼容，不改系统Python。
+openai==1.100.1
+chromadb==1.5.9
+python-dotenv==1.1.1
+prompt_toolkit==3.0.52
+fastapi==0.128.8
+uvicorn==0.34.3
+pydantic==2.13.4
+pydantic_core==2.46.4
+gradio==4.44.1
+starlette==0.49.3
+httpx==0.28.1
+zstandard==0.25.0
+prometheus-client==0.26.0
+cryptography==50.0.2
+cffi==2.1.1
+pycparser==3.12
+sentence-transformers==3.4.1
+transformers==4.51.3
+huggingface-hub==0.36.2
+torch==2.8.0
+numpy==2.2.6
+onnxruntime==1.23.2
+pytest==7.4.4
+pytest-cov==4.1.0
+pytest-asyncio==0.21.2
+ruff==0.15.22

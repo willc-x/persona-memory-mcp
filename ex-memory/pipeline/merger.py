@@ -1,0 +1,105 @@
+"""增量合并：将新素材 merge 进现有的 memory.md 和 persona.md，自动备份旧版本。"""
+
+import logging
+from datetime import datetime
+from pathlib import Path
+from config import get_llm_config, get_llm_client
+from core.mirror_store import mirror_store
+
+logger = logging.getLogger("ex-memory")
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+
+def merge_new_material(
+    slug: str,
+    new_materials: str,
+    source_type: str = "oral",
+    owner=None,
+) -> dict:
+    """将新素材增量合并到现有的 memory.md 和 persona.md。
+
+    策略：追加式合并 —— 保留现有内容，LLM 只产出新增/修订的增量部分，
+    而非重新生成整个文件，避免 LLM 幻觉截断已有记忆。
+
+    Args:
+        slug: 前任代号
+        new_materials: 新的原材料摘要
+        source_type: 来源类型（chat/oral/photo）
+        owner: 镜像归属账号（多用户嵌套目录）
+
+    Returns:
+        包含更新状态的字典
+    """
+    cfg = get_llm_config(owner) if owner is not None else get_llm_config()
+    if not cfg["api_key"]:
+        return {"error": "未配置 LLM API Key"}
+
+    client = get_llm_client(owner, cfg) if owner is not None else get_llm_client()
+    store = mirror_store(slug, owner)
+
+    merger_prompt = (PROMPTS_DIR / "merger.md").read_text(encoding="utf-8")
+
+    existing_memory = store.read_text("memory.md") if store.exists("memory.md") else ""
+    existing_persona = store.read_text("persona.md") if store.exists("persona.md") else ""
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # --- 自动备份 ---
+    try:
+        from core.version_manager import backup as do_backup
+
+        do_backup(slug, owner=owner)
+        logger.info("合并前自动备份完成: %s", slug)
+    except Exception as e:
+        logger.warning("自动备份失败（继续合并）: %s", e)
+
+    def _merge_one(target_rel: str, existing: str, task_hint: str) -> str:
+        """调用 LLM 生成增量并追加到目标文件，返回增量文本。"""
+        user_content = f"""## 现有 {Path(target_rel).name}（请完整保留）
+
+{existing}
+
+## 新增素材（来源：{source_type}，日期：{timestamp}）
+
+{new_materials}
+
+请输出要追加到 {Path(target_rel).name} 末尾的{task_hint}（Markdown 格式），不要重复已有内容。"""
+        response = client.chat.completions.create(
+            model=cfg["model"],
+            messages=[
+                {"role": "system", "content": merger_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.5,
+        )
+        delta = (response.choices[0].message.content or "").strip()
+        if delta:
+            merged = existing.rstrip() + f"\n\n---\n## 更新 — {timestamp}\n{delta}\n"
+            store.write_text(target_rel, merged)
+            logger.info("%s 增量更新: %d 字符", target_rel, len(delta))
+        else:
+            logger.warning("%s 未生成有效增量，跳过写入", target_rel)
+        return delta
+
+    memory_delta = _merge_one("memory.md", existing_memory, "新内容")
+    persona_delta = _merge_one("persona.md", existing_persona, "新观察")
+
+    # 重新生成 SKILL.md
+    from pipeline.skill_combiner import write_skill
+
+    write_skill(slug, owner=owner)
+
+    # 更新 meta.json
+    if store.exists("meta.json"):
+        meta = store.read_json("meta.json")
+        meta["updated_at"] = datetime.now().isoformat()
+        meta["pipeline_state"] = "merged"
+        store.write_json("meta.json", meta)
+
+    return {
+        "memory_updated": bool(memory_delta),
+        "persona_updated": bool(persona_delta),
+        "skill_regenerated": True,
+        "memory_delta_len": len(memory_delta),
+        "persona_delta_len": len(persona_delta),
+    }

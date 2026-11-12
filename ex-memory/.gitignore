@@ -1,0 +1,37 @@
+.env
+__pycache__/
+*.pyc
+exes/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+# 仅根目录运行时数据（evals/data/ 评测数据集需进仓库）
+/data/
+.DS_Store
+*.tmp
+logs/
+.planning/
+
+# 测试与覆盖率产物
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# 本地工具索引（不进仓库）
+.codegraph/
+.serena/
+
+# 本地 SQLite（运行时数据都在 /data/，根目录不应出现 .db）
+/*.db
+
+# 软著申请材料（含个人信息，不进仓库）
+软著申请材料/
+
+# 前端 lint 依赖（不引入构建步骤，只装 eslint）
+node_modules/
+package-lock.json
+sbom.json
+coverage.xml

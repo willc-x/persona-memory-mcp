@@ -1,0 +1,40 @@
+# 所有真实聊天、向量库、日志、密钥和蒸馏产物都不入库
+.env
+*.env
+!*.env.example
+config/provider.env
+config/local-login.json
+config/provider.json
+config/privacy-consent.json
+/data/
+/prepared/
+/runtime/
+/logs/
+/reports/
+/artifacts/
+/backups/
+/exes/
+/suhui-*/
+/private-data/
+/private/
+/.venv/
+/.venv-native/
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+__pycache__/
+.pytest_cache/
+.tmp-tests/
+.tmp-*/
+*.py[cod]
+.DS_Store
+# 上游自身运行目录（上游源码保持跟踪）
+/ex-memory/data/
+/ex-memory/exes/
+/ex-memory/logs/
+/ex-memory/.env
+/ex-memory/.venv/
+# 通用代码以外的工作区私有资料
+/聊天记录*.txt
+/chat_*.txt

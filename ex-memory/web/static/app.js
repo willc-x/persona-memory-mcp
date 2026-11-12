@@ -1,0 +1,3385 @@
+/* ex-memory 聊天模拟器 SPA */
+
+const BASE_PATH = document.documentElement.dataset.basePath || '';
+const PROXY_AUTH = document.documentElement.dataset.authMode === 'proxy';
+const API = `${BASE_PATH}/api`;
+const staticUrl = path => `${BASE_PATH}/static/${path.replace(/^\/+/, '')}`;
+document.documentElement.classList.toggle('web-runtime', PROXY_AUTH);
+let token = PROXY_AUTH ? '' : (localStorage.getItem('ex-memory-token') || '');
+let currentSlug = '';
+let currentName = '';
+let tabHistory = [];
+let speechRecognition = null;
+const messagePreviews = new Map();
+let authEpoch = 0;
+let accountModelSettings = null;
+let modelSettingsOperation = 0;
+let modelSettingsBusy = false;
+const memoryLoop = window.ExMemoryMemoryLoop.create({
+    document, storage: localStorage, request: api,
+    identity: () => ({epoch: authEpoch, slug: currentSlug}),
+    renderMessages: renderStoredMessages,
+    setBusy: busy => {
+        $('msg-input').disabled = busy;
+        $('msg-send').disabled = busy;
+    },
+    notify: showToast,
+});
+
+// ═══════════════════════════════════════
+// 懒加载工具
+// ═══════════════════════════════════════
+
+const LazyLoader = {
+    loaded: new Map(),
+
+    async load(url, type = 'script') {
+        if (this.loaded.has(url)) return this.loaded.get(url);
+
+        const promise = new Promise((resolve, reject) => {
+            let el;
+            if (type === 'script') {
+                el = document.createElement('script');
+                el.src = url;
+                el.async = true;
+            } else if (type === 'style') {
+                el = document.createElement('link');
+                el.href = url;
+                el.rel = 'stylesheet';
+            }
+            el.onload = () => resolve(el);
+            el.onerror = () => reject(new Error(`Failed to load ${url}`));
+            document.head.appendChild(el);
+        });
+
+        this.loaded.set(url, promise);
+        return promise;
+    },
+
+    preload(urls) {
+        urls.forEach(url => {
+            const link = document.createElement('link');
+            link.rel = 'preload';
+            link.href = url;
+            link.as = url.endsWith('.js') ? 'script' : 'style';
+            document.head.appendChild(link);
+        });
+    }
+};
+
+// 预加载关键资源
+LazyLoader.preload([staticUrl('style.css')]);
+
+// ═══════════════════════════════════════
+// 内存管理
+// ═══════════════════════════════════════
+
+const MemoryManager = {
+    timers: new Set(),
+    observers: new Set(),
+    listeners: new Map(),
+
+    // 注册定时器
+    setInterval(fn, delay) {
+        const id = setInterval(fn, delay);
+        this.timers.add(id);
+        return id;
+    },
+
+    setTimeout(fn, delay) {
+        const id = setTimeout(fn, delay);
+        this.timers.add(id);
+        return id;
+    },
+
+    // 清除所有定时器
+    clearAllTimers() {
+        this.timers.forEach(id => {
+            clearInterval(id);
+            clearTimeout(id);
+        });
+        this.timers.clear();
+    },
+
+    // 注册 IntersectionObserver
+    observe(el, callback, options) {
+        const observer = new IntersectionObserver(callback, options);
+        observer.observe(el);
+        this.observers.add(observer);
+        return observer;
+    },
+
+    // 清除所有观察者
+    clearAllObservers() {
+        this.observers.forEach(obs => obs.disconnect());
+        this.observers.clear();
+    },
+
+    // 注册事件监听器（自动清理）
+    addEventListener(el, event, handler, options) {
+        el.addEventListener(event, handler, options);
+        if (!this.listeners.has(el)) {
+            this.listeners.set(el, []);
+        }
+        this.listeners.get(el).push({ event, handler, options });
+    },
+
+    // 清除元素的所有监听器
+    clearListeners(el) {
+        const listeners = this.listeners.get(el);
+        if (listeners) {
+            listeners.forEach(({ event, handler, options }) => {
+                el.removeEventListener(event, handler, options);
+            });
+            this.listeners.delete(el);
+        }
+    },
+
+    // 内存使用检查
+    checkMemory() {
+        if (performance.memory) {
+            const used = performance.memory.usedJSHeapSize;
+            const limit = performance.memory.jsHeapSizeLimit;
+            const ratio = used / limit;
+            if (ratio > 0.8) {
+                console.warn(`[Memory] High usage: ${(ratio * 100).toFixed(1)}%`);
+                this.cleanup();
+            }
+        }
+    },
+
+    // 清理未使用资源
+    cleanup() {
+        // 清理过期的缓存
+        if (typeof cache !== 'undefined') {
+            cache.clear();
+        }
+        // 强制垃圾回收（如果可用）
+        if (window.gc) {
+            window.gc();
+        }
+    },
+
+    // 页面卸载时清理
+    destroy() {
+        this.clearAllTimers();
+        this.clearAllObservers();
+        this.listeners.forEach((_, el) => this.clearListeners(el));
+    }
+};
+
+// 页面卸载时自动清理
+window.addEventListener('beforeunload', () => MemoryManager.destroy());
+
+// 定期检查内存（每5分钟）
+MemoryManager.setInterval(() => MemoryManager.checkMemory(), 5 * 60 * 1000);
+
+// ── 情感健康：使用时长追踪 ──
+let loginTime = Date.now();
+let lastReminderTime = 0;
+const REMINDER_INTERVAL = 30 * 60 * 1000; // 30 分钟
+
+// ── Toast 通知系统 ──
+function ensureToastContainer() {
+    let c = document.querySelector('.toast-container');
+    if (!c) {
+        c = document.createElement('div');
+        c.className = 'toast-container';
+        c.setAttribute('role', 'status');
+        c.setAttribute('aria-live', 'polite');
+        document.body.appendChild(c);
+    }
+    return c;
+}
+
+function showToast(message, type = 'info', duration = 3000) {
+    const container = ensureToastContainer();
+    const icons = { success: '✓', error: '✗', info: 'ℹ', warning: '⚠' };
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `<span class="toast-icon">${icons[type] || icons.info}</span><span>${escHtml(String(message))}</span>`;
+    container.appendChild(toast);
+
+    setTimeout(() => {
+        toast.classList.add('toast-exit');
+        toast.addEventListener('animationend', () => toast.remove());
+    }, duration);
+}
+
+// 全局错误处理
+window.onerror = function(msg, src, line, col, err) {
+    showToast('发生了一个错误，请刷新页面重试', 'error');
+    console.error('[Global Error]', msg, src, line, col, err);
+    reportError({msg, src, line, col, stack: err?.stack});
+};
+
+window.addEventListener('unhandledrejection', function(e) {
+    showToast('操作失败，请稍后重试', 'error');
+    console.error('[Unhandled Rejection]', e.reason);
+    reportError({msg: e.reason?.message, stack: e.reason?.stack});
+});
+
+// 错误上报
+function reportError(errorData) {
+    try {
+        const errors = JSON.parse(localStorage.getItem('ex-memory-errors') || '[]');
+        errors.push({
+            ...errorData,
+            timestamp: new Date().toISOString(),
+            userAgent: navigator.userAgent,
+        });
+        // 保留最近 50 条错误
+        if (errors.length > 50) errors.splice(0, errors.length - 50);
+        localStorage.setItem('ex-memory-errors', JSON.stringify(errors));
+    } catch(e) {}
+}
+
+// 导出错误日志
+function exportErrorLog() {
+    const errors = localStorage.getItem('ex-memory-errors') || '[]';
+    const blob = new Blob([errors], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `ex-memory-errors-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+// 离线状态只由真实 API 请求结果驱动，不信任浏览器的 offline 事件。
+let networkOffline = false;
+
+function markNetworkOffline() {
+    if (PROXY_AUTH) return;
+    if (networkOffline) return;
+    networkOffline = true;
+    const banner = $('offline-banner');
+    if (banner) banner.classList.add('visible');
+    showToast('网络连接已断开', 'warning', 5000);
+}
+
+function markNetworkOnline() {
+    const recovered = networkOffline;
+    networkOffline = false;
+    const banner = $('offline-banner');
+    if (banner) banner.classList.remove('visible');
+    if (recovered) {
+        showToast('网络已恢复', 'success');
+        flushOfflineQueue();
+    }
+}
+
+window.addEventListener('online', markNetworkOnline);
+
+// ── 快捷引用 ──
+const $ = id => document.getElementById(id);
+
+async function retryNetwork() {
+    const button = $('offline-retry');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '检查中…';
+    }
+    try {
+        // 直接重试实际业务接口，避免“健康检查成功但体验服务仍不可用”的假恢复。
+        await api('GET', '/exes', undefined, 0);
+        if ($('page-main')?.style.display !== 'none') await loadContactList();
+    } catch (error) {
+        showToast('仍无法连接服务，请稍后重试', 'warning');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '重试';
+        }
+    }
+}
+
+$('offline-retry')?.addEventListener('click', retryNetwork);
+
+function authHeaders(json = true) {
+    const h = {};
+    if (json) h['Content-Type'] = 'application/json';
+    if (token) h['Authorization'] = `Bearer ${token}`;
+    return h;
+}
+
+function safeStickerUrl(url) {
+    if (!url || typeof url !== 'string') return '';
+    if (url.startsWith('/static/')) return `${BASE_PATH}${url}`;
+    return '';
+}
+
+async function parseChatStream(res, msgsEl, view = memoryLoop.capture()) {
+    if (!memoryLoop.isCurrent(view)) { await res.body?.cancel?.(); return null; }
+    if (res.status === 401) { logout(); return null; }
+    if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        if (!memoryLoop.isCurrent(view)) return null;
+        throw new Error(typeof d.detail === 'string' ? d.detail : '请求失败');
+    }
+
+    const replyRow = chatBubble('assistant', '');
+    msgsEl.appendChild(replyRow);
+    const assistantDiv = replyRow.querySelector('.msg');
+    let answerRows = [replyRow];
+    let metadata = null;
+    let sources = [];
+    let blocked = false;
+    let completed = false;
+    let text = '';
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+        const {done, value} = await reader.read();
+        if (!memoryLoop.isCurrent(view)) { await reader.cancel?.(); return null; }
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const raw = line.slice(6);
+            if (raw === '[DONE]') { completed = true; continue; }
+            let item;
+            try { item = JSON.parse(raw); } catch (_) { continue; }
+            if (item.type === 'metadata') {
+                metadata = item;
+            } else if (item.type === 'sources') {
+                sources = item.sources || [];
+            } else if (item.type === 'segments') {
+                answerRows = await renderSegments(msgsEl, replyRow, item.segments, view);
+            } else if (item.type === 'crisis' || item.type === 'blocked' || item.type === 'usage_limit') {
+                blocked = true;
+                answerRows.forEach(row => row.remove());
+                msgsEl.appendChild(noticeMsg(item));
+            } else if (item.error) {
+                blocked = true;
+                answerRows.forEach(row => row.remove());
+                msgsEl.appendChild(sysMsg(item.error));
+            } else if (item.type === 'text' && item.content) {
+                text += item.content;
+                assistantDiv.textContent = text;
+            } else if (item.type === 'sticker' && item.id) {
+                msgsEl.appendChild(stickerMsg(item.id));
+            } else if (item.type === 'red_packet') {
+                msgsEl.appendChild(redPacketBubble(item));
+            } else if (item.type === 'transfer') {
+                msgsEl.appendChild(transferBubble(item));
+            }
+            if (!memoryLoop.isCurrent(view)) { await reader.cancel?.(); return null; }
+        }
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+    if (!memoryLoop.isCurrent(view)) return null;
+    if (!completed) throw new Error('回复未完整接收，请刷新会话查看已保存记录');
+    if (blocked) return null;
+    const finalRow = answerRows[answerRows.length - 1];
+    const finalDiv = finalRow?.querySelector('.msg');
+    if (!finalDiv?.textContent.trim()) { finalRow?.remove(); return null; }
+    memoryLoop.decorate(finalRow, metadata || {conversation_id: view.conversationId, sources}, view);
+    storeLastMessage(view.slug, text || finalDiv.textContent);
+    showDesktopNotification(currentName || view.slug, (text || finalDiv.textContent).slice(0, 60), view.slug);
+    return finalDiv;
+}
+
+function initTheme() {
+    const saved = localStorage.getItem('ex-memory-theme') || 'auto';
+    applyTheme(saved);
+    // 延迟绑定，因为 select 元素可能还未渲染
+    setTimeout(() => {
+        const select = $('theme-select');
+        if (select) {
+            select.value = saved;
+            select.addEventListener('change', () => {
+                const theme = select.value;
+                localStorage.setItem('ex-memory-theme', theme);
+                applyTheme(theme);
+            });
+        }
+    }, 100);
+}
+
+function applyTheme(theme) {
+    const root = document.documentElement;
+    if (theme === 'auto') {
+        root.removeAttribute('data-theme');
+    } else {
+        root.setAttribute('data-theme', theme);
+    }
+    // 更新 theme-color meta 标签
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) {
+        meta.content = theme === 'dark' ? '#0a0a12' : '#F2F2F7';
+    }
+}
+
+// ── 字体大小调节 ──
+function initFontSize() {
+    const saved = localStorage.getItem('ex-memory-fontsize') || 'normal';
+    applyFontSize(saved);
+    setTimeout(() => {
+        const select = $('font-size-select');
+        if (select) {
+            select.value = saved;
+            select.addEventListener('change', () => {
+                const size = select.value;
+                localStorage.setItem('ex-memory-fontsize', size);
+                applyFontSize(size);
+            });
+        }
+    }, 100);
+}
+
+function applyFontSize(size) {
+    const root = document.documentElement;
+    const sizes = {
+        'small': '14px',
+        'normal': '16px',
+        'large': '18px',
+        'xlarge': '20px',
+    };
+    root.style.setProperty('--base-font-size', sizes[size] || '16px');
+}
+
+// ── 平台检测（响应窗口大小变化）──
+let isDesktop = window.matchMedia('(min-width: 769px)').matches;
+let desktopTab = 'chat';
+let currentTab = 'chat-list';
+
+window.matchMedia('(min-width: 769px)').addEventListener('change', e => {
+    const wasDesktop = isDesktop;
+    isDesktop = e.matches;
+    if (wasDesktop !== isDesktop) {
+        // 平台切换时重新初始化布局
+        if (isDesktop) {
+            $('page-main').style.display = 'flex';
+            setDesktopMode('chat');
+        } else {
+            $('page-main').style.display = 'block';
+            switchTab('chat-list');
+        }
+    }
+}); // chat | contacts | discover | me
+
+// ── 移动手势初始化 ──
+function initMobileGestures() {
+    // 左滑返回手势
+    let touchStartX = 0;
+    let touchEndX = 0;
+
+    document.addEventListener('touchstart', (e) => {
+        touchStartX = e.changedTouches[0].screenX;
+    }, {passive: true});
+
+    document.addEventListener('touchend', (e) => {
+        touchEndX = e.changedTouches[0].screenX;
+        handleSwipe();
+    }, {passive: true});
+
+    function handleSwipe() {
+        const swipeThreshold = 50;
+        const diff = touchStartX - touchEndX;
+
+        if (Math.abs(diff) > swipeThreshold) {
+            if (diff > 0) {
+                // 左滑：返回上一级
+                handleSwipeLeft();
+            } else {
+                // 右滑：前进
+                handleSwipeRight();
+            }
+        }
+    }
+
+    function handleSwipeLeft() {
+        if (tabHistory.length > 1) {
+            tabHistory.pop();
+            const prevTab = tabHistory[tabHistory.length - 1];
+            switchTab(prevTab);
+        }
+    }
+
+    function handleSwipeRight() {
+        // 在聊天详情页左滑返回列表
+        if (currentTab === 'chat-detail' && !isDesktop) {
+            switchTab('chat-list');
+        }
+    }
+}
+
+// ── 键盘弹出适配 ──
+function initKeyboardAdaptation() {
+    const chatInput = $('msg-input');
+    if (!chatInput) return;
+
+    // 聚焦输入框时滚动到底部
+    chatInput.addEventListener('focus', () => {
+        setTimeout(() => {
+            const msgsEl = $('chat-msgs');
+            if (msgsEl) msgsEl.scrollTop = msgsEl.scrollHeight;
+        }, 300);
+    });
+}
+
+// ── 安全区域适配 ──
+function initSafeArea() {
+    // 检测是否支持安全区域
+    if (CSS.supports('padding', 'env(safe-area-inset-bottom)')) {
+        document.documentElement.classList.add('has-safe-area');
+    }
+}
+
+// ── 情感健康：使用时长提醒（每 10 分钟检查一次）──
+setInterval(checkUsageReminder, 10 * 60 * 1000);
+
+function checkUsageReminder() {
+    if (!token || !currentSlug) return;
+    const now = Date.now();
+    if (now - loginTime > REMINDER_INTERVAL && now - lastReminderTime > REMINDER_INTERVAL) {
+        lastReminderTime = now;
+        showMindfulReminder();
+    }
+}
+
+function showMindfulReminder() {
+    // 在聊天中插入系统消息，而非弹窗打断
+    const msgsEl = $('chat-msgs');
+    if (!msgsEl || msgsEl.style.display === 'none') return;
+    fetchHealthTip().then(tip => {
+        const row = document.createElement('div');
+        row.className = 'msg-row sys';
+        row.innerHTML = `<div class="msg mindful-msg">🌿 ${escHtml(tip)}</div>`;
+        msgsEl.appendChild(row);
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+    });
+    loginTime = Date.now(); // 重置计时
+}
+
+async function fetchHealthTip() {
+    // 深夜个性化提示
+    const hour = new Date().getHours();
+    const tips = {
+        lateNight: [
+            '这么晚了还在想 ta 吗？早点休息 🌙',
+            '夜深了，放下手机，闭上眼睛休息吧',
+            '深夜的情绪总是特别浓，但明天会更好',
+            '又失眠了？深呼吸三次，感受当下的平静',
+        ],
+        earlyMorning: [
+            '新的一天，好好生活 🌅',
+            '早安，今天也要加油哦',
+            '新的一天开始了，做点让自己开心的事',
+        ],
+        daytime: [
+            '适当休息一下，看看窗外的风景',
+            '深呼吸三次，感受当下的平静',
+            '和真实的朋友聊聊天，感受真实的温暖',
+            '运动 10 分钟，让身体和心情都好起来',
+        ],
+    };
+
+    let pool = tips.daytime;
+    if (hour >= 0 && hour < 6) pool = tips.lateNight;
+    else if (hour >= 6 && hour < 9) pool = tips.earlyMorning;
+
+    try {
+        const data = await api('GET', '/user/health/check');
+        if (data.health_tip) return data.health_tip;
+    } catch(e) {}
+
+    return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ── 正念引导：退出时的温暖告别 ──
+window.addEventListener('beforeunload', (e) => {
+    if (!token) return;
+    const msg = '随时回来找我 🌙';
+    e.returnValue = msg;
+    return msg;
+});
+
+// ── 情感健康贴士：加载到聊天列表底部 ──
+async function loadHealthTip() {
+    const container = $('health-tip-container');
+    if (!container) return;
+    try {
+        const tip = await fetchHealthTip();
+        container.innerHTML = `<div class="health-tip">${escHtml(tip)}</div>`;
+    } catch(e) {
+        container.innerHTML = `<div class="health-tip">深呼吸三次，感受当下的平静。</div>`;
+    }
+}
+
+function updateStatusTime() {
+    const now = new Date();
+    const el = $('status-time');
+    if (el) el.textContent = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
+}
+
+function initDesktopLayout() {
+    if (!isDesktop) return;
+    setDesktopMode('chat');
+}
+
+function setDesktopMode(mode) {
+    clearModelSecrets();
+    desktopTab = mode;
+    const content = $('phone-content');
+    if (!content) return;
+    // 清除所有模式类
+    content.className = 'phone-content ' + mode + '-mode';
+
+    // 隐藏所有 tab 页
+    const tabs = ['tab-chat-list','tab-chat-detail','tab-contacts',
+                  'tab-discover','tab-me','tab-wallet','tab-create','tab-models'];
+    tabs.forEach(id => {
+        const el = $(id);
+        if (el) el.style.display = 'none';
+    });
+
+    // 更新标题
+    const titles = { chat: 'ex-memory', contacts: '通讯录', discover: '发现', me: '我' };
+    $('nav-title').textContent = titles[mode] || 'ex-memory';
+    $('titlebar-app-name').textContent = titles[mode] || 'ex-memory';
+    $('nav-back-btn').style.display = 'none';
+    $('nav-action-btn').style.display = 'none';
+
+    switch (mode) {
+        case 'chat':
+            $('tab-chat-list').style.display = 'block';
+            if (currentSlug) {
+                $('tab-chat-detail').style.display = 'flex';
+                $('nav-title').textContent = currentName || currentSlug;
+                $('titlebar-app-name').textContent = currentName || currentSlug;
+                $('nav-action-btn').style.display = 'block';
+                // 高亮当前联系人
+                document.querySelectorAll('.contact-item').forEach(c => {
+                    c.classList.toggle('selected', c.dataset.slug === currentSlug);
+                });
+            } else {
+                $('tab-chat-detail').style.display = 'none';
+            }
+            loadContactList();
+            break;
+        case 'contacts':
+            $('tab-contacts').style.display = 'block';
+            if (currentSlug) showContactProfile();
+            break;
+        case 'discover':
+            $('tab-discover').style.display = 'block';
+            break;
+        case 'me':
+            $('tab-me').style.display = 'block';
+            $('me-username').textContent = localStorage.getItem('ex-memory-username') || '我';
+            break;
+    }
+}
+
+// ── 桌面端侧边栏导航 ──
+function initDesktopSidebar() {
+    if (!isDesktop) return;
+    document.querySelectorAll('.sidebar-icon').forEach(icon => {
+        icon.addEventListener('click', () => {
+            const tab = icon.dataset.desktopTab;
+            if (!tab) return;
+            // 更新高亮
+            document.querySelectorAll('.sidebar-icon').forEach(i => i.classList.remove('active'));
+            icon.classList.add('active');
+            // 切换到对应模式
+            setDesktopMode(tab);
+            // 如果是非聊天模式，保留当前聊天状态但不显示
+            if (tab !== 'chat' && currentSlug) {
+                // 聊天保持在后台，切换回来时恢复
+            }
+        });
+        // 键盘支持：Enter/Space 激活
+        icon.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                icon.click();
+            }
+        });
+    });
+}
+
+// ── 离线消息队列 ──
+const OFFLINE_QUEUE_KEY = 'ex-memory-offline-queue';
+
+function getOfflineQueue() {
+    try { return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]'); }
+    catch { return []; }
+}
+
+function saveOfflineQueue(queue) {
+    localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
+}
+
+function enqueueOfflineMessage(slug, message, stickerId) {
+    const queue = getOfflineQueue();
+    queue.push({ slug, message, stickerId, timestamp: Date.now() });
+    saveOfflineQueue(queue);
+    showToast('消息已离线保存，恢复网络后自动发送', 'info', 3000);
+}
+
+async function flushOfflineQueue() {
+    const queue = getOfflineQueue();
+    if (!queue.length) return;
+    saveOfflineQueue([]);
+    showToast(`正在发送 ${queue.length} 条离线消息…`, 'info', 3000);
+    for (const item of queue) {
+        try {
+            await fetch(`${API}/chat/stream`, {
+                method: 'POST',
+                headers: authHeaders(),
+                body: JSON.stringify({ slug: item.slug, message: item.message || '', sticker_id: item.stickerId, history: [] }),
+            });
+        } catch { /* 单条失败不阻塞后续 */ }
+    }
+    showToast('离线消息发送完成', 'success');
+}
+
+// ── Service Worker ──
+function registerSW() {
+    if (!PROXY_AUTH && 'serviceWorker' in navigator) {
+        navigator.serviceWorker.register(staticUrl('sw.js')).then(reg => {
+            // 检查更新
+            reg.addEventListener('updatefound', () => {
+                const newWorker = reg.installing;
+                if (newWorker) {
+                    newWorker.addEventListener('statechange', () => {
+                        if (newWorker.state === 'activated') {
+                            showToast('应用已更新，刷新页面获取最新版本', 'info', 5000);
+                        }
+                    });
+                }
+            });
+        }).catch(err => {
+            console.warn('[SW] 注册失败:', err);
+        });
+    }
+}
+
+// ── 推送通知 ──
+function requestNotificationPermission() {
+    if (!('Notification' in window)) return;
+    if (Notification.permission === 'default') {
+        Notification.requestPermission();
+    }
+}
+
+function showDesktopNotification(title, body, slug) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const notif = new Notification(title, { body, icon: staticUrl('icon-192.svg'), tag: slug || 'ex-memory' });
+    notif.onclick = () => {
+        window.focus();
+        if (slug) enterChat(slug, slug);
+        notif.close();
+    };
+}
+
+// ═══════════════════════════════════════
+// 认证页
+// ═══════════════════════════════════════
+
+function showAuth() {
+    $('page-auth').style.display = 'flex';
+    $('page-main').style.display = 'none';
+    showLoginForm();
+}
+
+function showMain() {
+    $('page-auth').style.display = 'none';
+    if (isDesktop) {
+        $('page-main').style.display = 'flex';
+    } else {
+        $('page-main').style.display = 'block';
+    }
+    loadContactList();
+    loadStickers();
+    if (isDesktop) {
+        setDesktopMode('chat');
+    } else {
+        // 初始显示聊天列表，无需动画
+        const el = $('tab-chat-list');
+        el.style.display = 'block';
+        el.classList.add('visible');
+        document.querySelectorAll('.tabbar-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.tab === 'chat-list');
+        });
+    }
+}
+
+function showLoginForm() {
+    $('form-login').style.display = 'flex';
+    $('form-register').style.display = 'none';
+    $('tab-login-btn').classList.add('active');
+    $('tab-register-btn').classList.remove('active');
+    $('login-error').textContent = '';
+}
+
+function showRegForm() {
+    $('form-login').style.display = 'none';
+    $('form-register').style.display = 'flex';
+    $('tab-register-btn').classList.add('active');
+    $('tab-login-btn').classList.remove('active');
+    $('reg-error').textContent = '';
+}
+
+$('tab-login-btn').onclick = showLoginForm;
+$('tab-register-btn').onclick = showRegForm;
+
+// ── 密码切换 ──
+document.querySelectorAll('.pwd-toggle').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const input = document.getElementById(btn.dataset.target);
+        if (!input) return;
+        const isPwd = input.type === 'password';
+        input.type = isPwd ? 'text' : 'password';
+        btn.textContent = isPwd ? '🙈' : '👁';
+    });
+});
+
+// ── 登录 ──
+async function doLogin() {
+    const u = $('login-username').value.trim();
+    const p = $('login-password').value;
+    const err = $('login-error'), btn = $('login-submit');
+    if (!u || !p) { err.textContent = '请填写用户名和密码'; return; }
+    btn.textContent = '登录中…'; btn.disabled = true; err.textContent = '';
+    try {
+        const res = await fetch(`${API}/auth/login`, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({username:u, password:p}),
+        });
+        const data = await res.json();
+        if (res.ok) {
+            resetSessionView();
+            token = data.token;
+            localStorage.setItem('ex-memory-token', token);
+            localStorage.setItem('ex-memory-username', u);
+            showMain();
+        } else { err.textContent = data.detail || '登录失败'; }
+    } catch(e) { err.textContent = '网络错误'; }
+    finally { btn.textContent = '登录'; btn.disabled = false; }
+}
+$('login-submit').onclick = doLogin;
+$('login-username').onkeydown = e => { if(e.key==='Enter') $('login-password').focus(); };
+$('login-password').onkeydown = e => { if(e.key==='Enter') doLogin(); };
+
+// ── 注册 ──
+async function doRegister() {
+    const u = $('reg-username').value.trim();
+    const p = $('reg-password').value, p2 = $('reg-password2').value;
+    const err = $('reg-error'), btn = $('reg-submit');
+    if (u.length < 2) { err.textContent = '用户名至少2个字符'; return; }
+    if (p.length < 6) { err.textContent = '密码至少6个字符'; return; }
+    if (p !== p2) { err.textContent = '两次密码输入不一致'; return; }
+    btn.textContent = '注册中…'; btn.disabled = true; err.textContent = '';
+    try {
+        const res = await fetch(`${API}/auth/register`, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({username:u, password:p}),
+        });
+        if (!res.ok) { const d = await res.json(); err.textContent = d.detail || '注册失败'; return; }
+        const loginRes = await fetch(`${API}/auth/login`, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({username:u, password:p}),
+        });
+        const loginData = await loginRes.json();
+        if (loginRes.ok) {
+            resetSessionView();
+            token = loginData.token;
+            localStorage.setItem('ex-memory-token', token);
+            localStorage.setItem('ex-memory-username', u);
+            showMain();
+        } else { err.textContent = '注册成功但自动登录失败'; showLoginForm(); }
+    } catch(e) { err.textContent = '网络错误'; }
+    finally { btn.textContent = '注册'; btn.disabled = false; }
+}
+$('reg-submit').onclick = doRegister;
+$('reg-username').onkeydown = e => { if(e.key==='Enter') $('reg-password').focus(); };
+$('reg-password').onkeydown = e => { if(e.key==='Enter') $('reg-password2').focus(); };
+$('reg-password2').onkeydown = e => { if(e.key==='Enter') doRegister(); };
+
+// ═══════════════════════════════════════
+// API 封装
+// ═══════════════════════════════════════
+
+// 请求去重
+const pendingRequests = new Map();
+
+function isNetworkFailure(error) {
+    return ['AbortError', 'TimeoutError', 'TypeError'].includes(error?.name);
+}
+
+async function api(method, path, body, retries = 2) {
+    if (false) {
+        showToast('网络连接已断开，请检查网络', 'warning');
+        throw new Error('网络连接已断开');
+    }
+
+    // GET 请求去重
+    const requestEpoch = authEpoch;
+    const requestKey = method === 'GET' ? `${requestEpoch}:${method}:${path}` : null;
+    if (requestKey && pendingRequests.has(requestKey)) {
+        return pendingRequests.get(requestKey);
+    }
+
+    const headers = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+
+    const promise = (async () => {
+        for (let i = 0; i <= retries; i++) {
+            try {
+                if (requestEpoch !== authEpoch) throw new Error('会话已变化，请重新读取');
+                const res = await fetch(`${API}${path}`, {
+                    method, headers,
+                    body: body !== undefined ? JSON.stringify(body) : undefined,
+                    signal: AbortSignal.timeout(10000),
+                });
+                if (requestEpoch !== authEpoch) throw new Error('会话已变化，请重新读取');
+                if (res.status === 401) { logout(); throw new Error('登录已过期'); }
+                const data = await res.json().catch(() => ({}));
+                if (requestEpoch !== authEpoch) throw new Error('会话已变化，请重新读取');
+                if (!res.ok) throw new Error(data.detail || `请求失败 (${res.status})`);
+                markNetworkOnline();
+                return data;
+            } catch(e) {
+                if (requestEpoch !== authEpoch) throw new Error('会话已变化，请重新读取');
+                const networkFailure = isNetworkFailure(e);
+                if (i < retries && networkFailure) {
+                    await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+                    continue;
+                }
+                if (networkFailure) markNetworkOffline();
+                throw e;
+            }
+        }
+    })();
+
+    if (requestKey) {
+        pendingRequests.set(requestKey, promise);
+        const clearPendingRequest = () => pendingRequests.delete(requestKey);
+        promise.then(clearPendingRequest, clearPendingRequest);
+    }
+
+    return promise;
+}
+
+function resetSessionView() {
+    authEpoch += 1;
+    memoryLoop.reset();
+    pendingRequests.clear();
+    messagePreviews.clear();
+    resetImportForm();
+    invalidateImportConfig();
+    resetModelSettings();
+    $('chat-msgs').innerHTML = '';
+    $('contact-list').innerHTML = '';
+    $('msg-input').disabled = true;
+    $('msg-send').disabled = true;
+    currentSlug = ''; currentName = '';
+}
+
+function logout() {
+    resetSessionView();
+    if (PROXY_AUTH) {
+        window.parent.postMessage({type: 'ex-memory:session-expired'}, window.location.origin);
+        return;
+    }
+    if (token) {
+        fetch(`${API}/auth/logout`, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({token}),
+        }).catch(()=>{});
+    }
+    token = ''; currentSlug = ''; currentName = '';
+    localStorage.removeItem('ex-memory-token');
+    showAuth();
+}
+
+// ═══════════════════════════════════════
+// 移动端 Tab 导航
+// ═══════════════════════════════════════
+
+function switchTab(tab) {
+    if (tab === 'create') loadImportConfig();
+    if (tab === 'models') loadModelSettings();
+    else clearModelSecrets();
+    currentTab = tab;
+    tabHistory.push(tab);
+    if (tabHistory.length > 10) tabHistory.shift();
+
+    // 桌面端：使用模式切换
+    if (isDesktop) {
+        const modeMap = {
+            'chat-list': 'chat', 'chat-detail': 'chat',
+            'contacts': 'contacts', 'discover': 'discover',
+            'me': 'me', 'create': 'me', 'wallet': 'me', 'models': 'me'
+        };
+        const mode = modeMap[tab] || 'chat';
+        // 更新侧边栏高亮
+        document.querySelectorAll('.sidebar-icon').forEach(i => {
+            const isActive = i.dataset.desktopTab === mode;
+            i.classList.toggle('active', isActive);
+            i.setAttribute('aria-selected', isActive);
+        });
+        setDesktopMode(mode);
+        // 如果切换到钱包或创建，显示对应页面
+        if (tab === 'wallet') {
+            $('tab-me').style.display = 'none';
+            $('tab-wallet').style.display = 'block';
+            $('nav-title').textContent = '钱包';
+            $('titlebar-app-name').textContent = '钱包';
+            $('nav-back-btn').style.display = 'block';
+            loadWallet();
+            animateTabSwitch($('tab-wallet'));
+        } else if (tab === 'create') {
+            $('phone-content').className = 'phone-content create-mode';
+            $('tab-me').style.display = 'none';
+            $('tab-create').style.display = 'block';
+            $('nav-title').textContent = '创建镜像';
+            $('titlebar-app-name').textContent = '创建镜像';
+            $('nav-back-btn').style.display = 'block';
+        } else if (tab === 'models') {
+            $('phone-content').className = 'phone-content models-mode';
+            $('tab-me').style.display = 'none';
+            $('tab-models').style.display = 'block';
+            $('nav-title').textContent = '模型设置';
+            $('titlebar-app-name').textContent = '模型设置';
+            $('nav-back-btn').style.display = 'block';
+        }
+        return;
+    }
+
+    // 移动端：单页面切换（带过渡动画）
+    const isBack = tabHistory.length > 1 && tabHistory[tabHistory.length - 2] === tab;
+    const allPages = document.querySelectorAll('.tab-page');
+    const currentPage = document.querySelector('.tab-page.visible');
+
+    allPages.forEach(p => {
+        p.classList.remove('visible', 'slide-back');
+    });
+
+    const targetEl = document.getElementById('tab-' + tab);
+    if (targetEl) {
+        targetEl.style.display = 'block';
+        // 触发重排后添加动画类
+        requestAnimationFrame(() => {
+            if (isBack) targetEl.classList.add('slide-back');
+            requestAnimationFrame(() => {
+                targetEl.classList.add('visible');
+                // 隐藏其他页面（延迟以允许过渡完成）
+                setTimeout(() => {
+                    allPages.forEach(p => {
+                        if (p !== targetEl) p.style.display = 'none';
+                    });
+                }, 250);
+            });
+        });
+    }
+
+    // 更新底部 tab 高亮
+    const rootTabs = { 'chat-list': 'chat-list', 'chat-detail': 'chat-list',
+                        contacts:'contacts', discover:'discover', me:'me', create:'me', wallet:'me', models:'me' };
+    const activeRoot = rootTabs[tab] || 'chat-list';
+    document.querySelectorAll('.tabbar-btn').forEach(b => {
+        const isActive = b.dataset.tab === activeRoot;
+        b.classList.toggle('active', isActive);
+        b.setAttribute('aria-selected', isActive);
+    });
+
+    // 更新导航栏
+    updateNavbar(tab);
+
+    // 加载数据
+    if (tab === 'chat-list') loadContactList();
+    if (tab === 'contacts' && currentSlug) showContactProfile();
+    if (tab === 'me') $('me-username').textContent = localStorage.getItem('ex-memory-username') || '我';
+    if (tab === 'wallet') loadWallet();
+}
+
+function updateNavbar(tab) {
+    const back = $('nav-back-btn'), title = $('nav-title'), action = $('nav-action-btn');
+    back.style.display = 'none'; action.style.display = 'none';
+
+    const titles = {
+        'chat-list': 'ex-memory',
+        'chat-detail': currentName || currentSlug || '聊天',
+        'contacts': '通讯录',
+        'discover': '发现',
+        'me': '我',
+        'create': '创建镜像',
+        'models': '模型设置',
+        'wallet': '钱包',
+    };
+    title.textContent = titles[tab] || 'ex-memory';
+
+    if (tab === 'chat-detail') {
+        back.style.display = 'block';
+        action.style.display = 'block';
+    }
+    if (tab === 'create' || tab === 'models') {
+        back.style.display = 'block';
+    }
+}
+
+$('nav-back-btn').onclick = () => {
+    if (currentTab === 'chat-detail') {
+        switchTab('chat-list');
+    } else if (currentTab === 'create') {
+        switchTab('me');
+    } else if (currentTab === 'wallet') {
+        switchTab('me');
+    } else {
+        // 从历史中返回
+        if (tabHistory.length > 1) {
+            tabHistory.pop();
+            const prev = tabHistory.pop();
+            switchTab(prev);
+        }
+    }
+};
+
+$('nav-action-btn').onclick = () => {
+    if ((currentTab === 'chat-detail' || (isDesktop && desktopTab === 'chat')) && currentSlug) {
+        showChatActions();
+    }
+};
+
+// 移动端底部按钮点击
+document.querySelectorAll('.tabbar-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        if (tab === 'chat-list') {
+            if (currentSlug && currentTab === 'chat-list') {
+                enterChat(currentSlug, currentName);
+                return;
+            }
+        }
+        switchTab(tab);
+    });
+});
+
+// ═══════════════════════════════════════
+// 聊天操作菜单
+// ═══════════════════════════════════════
+
+// ── Action Sheet / Confirm 工具函数 ──
+function showActionSheet(options) {
+    // options: [{label, danger?, onClick}]
+    const overlay = $('action-sheet-overlay');
+    const optionsEl = $('action-sheet-options');
+    optionsEl.innerHTML = '';
+    options.forEach(opt => {
+        const btn = document.createElement('button');
+        btn.className = 'action-sheet-option' + (opt.danger ? ' danger' : '');
+        btn.textContent = opt.label;
+        btn.onclick = () => { overlay.style.display = 'none'; opt.onClick(); };
+        optionsEl.appendChild(btn);
+    });
+    overlay.style.display = 'flex';
+    $('action-sheet-cancel').onclick = () => { overlay.style.display = 'none'; };
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.style.display = 'none'; };
+}
+
+function showConfirm(title, message, onConfirm, danger = false) {
+    $('confirm-title').textContent = title;
+    $('confirm-message').textContent = message;
+    const overlay = $('confirm-overlay');
+    overlay.style.display = 'flex';
+    $('confirm-ok-btn').className = 'confirm-btn' + (danger ? ' danger' : '');
+    $('confirm-ok-btn').onclick = () => { overlay.style.display = 'none'; onConfirm(); };
+    $('confirm-cancel-btn').onclick = () => { overlay.style.display = 'none'; };
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.style.display = 'none'; };
+}
+
+function showChatActions() {
+    showActionSheet([
+        { label: '新建会话', onClick: () => memoryLoop.newConversation() },
+        { label: '删除镜像', danger: true, onClick: () => {
+            showConfirm(
+                '删除镜像',
+                `确定删除 [${currentSlug}]？此操作不可恢复。`,
+                () => {
+                    api('DELETE', `/exes/${currentSlug}`, {confirm:true}).then(() => {
+                        currentSlug = ''; currentName = '';
+                        switchTab('chat-list');
+                    }).catch(e => showToast('删除失败: ' + e.message, 'error'));
+                },
+                true
+            );
+        }},
+    ]);
+}
+
+// ═══════════════════════════════════════
+// 联系人列表
+// ═══════════════════════════════════════
+
+async function loadContactList() {
+    const requestEpoch = authEpoch;
+    PerfMonitor.start('loadContactList');
+    const el = $('contact-list');
+    // 清理旧的事件监听器
+    el.querySelectorAll('.contact-item').forEach(item => {
+        item.onclick = null;
+    });
+    // 加载微光骨架
+    el.innerHTML = Array.from({length:3}, () => `
+        <div class="skeleton-row">
+            <div class="skeleton-avatar"></div>
+            <div class="skeleton-body">
+                <div class="skeleton-line long"></div>
+                <div class="skeleton-line short"></div>
+            </div>
+        </div>
+    `).join('');
+    try {
+        const exes = await api('GET', '/exes');
+        if (requestEpoch !== authEpoch) return;
+        if (!exes.length) {
+            el.innerHTML = `
+                <div class="onboarding-card">
+                    <div class="onboarding-icon">💬</div>
+                    <h3 class="onboarding-title">创建你的第一个镜像</h3>
+                    <ol class="onboarding-steps" aria-label="创建镜像的三个步骤">
+                        <li><span>1</span><div><strong>配置自己的模型</strong><small>按账号保存对话与 Embedding Key</small></div></li>
+                        <li><span>2</span><div><strong>导入聊天记录</strong><small>可先下载虚构示例体验</small></div></li>
+                        <li><span>3</span><div><strong>创建镜像并对话</strong><small>模型费用由你的服务商账户承担</small></div></li>
+                    </ol>
+                    <button class="btn onboarding-btn" id="onboarding-models">配置我的模型</button>
+                    <button class="btn onboarding-btn" id="onboarding-create">导入并创建</button>
+                </div>`;
+            $('onboarding-models').addEventListener('click', () => switchTab('models'));
+            $('onboarding-create').addEventListener('click', () => switchTab('create'));
+            PerfMonitor.end('loadContactList');
+            return;
+        }
+        // 优化：使用 DocumentFragment 批量插入
+        const fragment = document.createDocumentFragment();
+        exes.forEach(e => {
+            const lastMsg = getLastMessage(e.slug);
+            const pending = e.state !== 'completed' && e.state !== 'unknown';
+            const isOnline = Math.random() > 0.6;
+            const div = document.createElement('div');
+            div.className = 'contact-item';
+            div.dataset.slug = e.slug;
+            div.dataset.name = e.name;
+            div.innerHTML = `
+                <div class="contact-avatar" style="background:${avatarColor(e.slug)}">
+                    ${escHtml((e.name || e.slug)[0])}
+                    <span class="online-dot ${isOnline ? 'online' : ''}"></span>
+                </div>
+                <div class="contact-info">
+                    <div class="contact-name">${escHtml(e.name)}</div>
+                    <div class="contact-preview">
+                        ${pending ? '<span class="preview-source">尚未完成 · 继续导入</span>' : lastMsg ? escHtml(lastMsg) : '<span class="preview-source">[点击开始对话]</span>'}
+                    </div>
+                </div>
+                <div class="contact-meta">
+                    <div class="contact-time">${(e.created_at || '').slice(0,10)}</div>
+                </div>`;
+            div.addEventListener('click', () => {
+                if (pending) resumeImport(e);
+                else enterChat(div.dataset.slug, div.dataset.name);
+            });
+            fragment.appendChild(div);
+        });
+        el.innerHTML = '';
+        el.appendChild(fragment);
+
+        // 桌面端恢复高亮
+        if (isDesktop && currentSlug) {
+            document.querySelectorAll('.contact-item').forEach(c => {
+                c.classList.toggle('selected', c.dataset.slug === currentSlug);
+            });
+        }
+
+        PerfMonitor.end('loadContactList');
+
+        // 情感健康贴士
+        let tipEl = $('health-tip-container');
+        if (!tipEl) {
+            tipEl = document.createElement('div');
+            tipEl.id = 'health-tip-container';
+            el.appendChild(tipEl);
+        }
+        loadHealthTip();
+    } catch(e) {
+        if (requestEpoch !== authEpoch) return;
+        el.innerHTML = '<p class="list-empty">加载失败: ' + escHtml(e.message) + '</p>';
+    }
+}
+
+function initSearch() {
+    const input = $('search-input');
+    if (!input) return;
+    input.addEventListener('input', () => {
+        const q = input.value.trim().toLowerCase();
+        document.querySelectorAll('.contact-item').forEach(item => {
+            const name = (item.dataset.name || '').toLowerCase();
+            const slug = (item.dataset.slug || '').toLowerCase();
+            item.style.display = (!q || name.includes(q) || slug.includes(q)) ? '' : 'none';
+        });
+        // 无匹配提示
+        const visible = document.querySelectorAll('.contact-item[style=""]').length;
+        const existing = document.querySelector('.search-no-result');
+        if (!q) {
+            if (existing) existing.remove();
+        } else if (visible === 0 && !existing) {
+            const hint = document.createElement('p');
+            hint.className = 'list-empty search-no-result';
+            hint.textContent = '没有匹配的镜像';
+            $('contact-list').appendChild(hint);
+        } else if (visible > 0 && existing) {
+            existing.remove();
+        }
+    });
+}
+
+function renderStoredMessages(messages, view) {
+    if (!memoryLoop.isCurrent(view)) return;
+    const msgsEl = $('chat-msgs');
+    msgsEl.innerHTML = '';
+    lastMsgTime = 0;
+    messages.forEach(message => {
+        const row = chatBubble(message.role, message.content);
+        row.dataset.timestamp = Date.parse(message.created_at) || Date.now();
+        msgsEl.appendChild(row);
+        if (message.role === 'assistant') {
+            memoryLoop.decorate(row, {
+                message_id: message.id, conversation_id: view.conversationId,
+                sources: message.sources || [],
+            }, view);
+        }
+    });
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+}
+
+function enterChat(slug, name) {
+    currentSlug = slug;
+    currentName = name;
+    lastMsgTime = 0;
+    $('chat-msgs').innerHTML = '';
+    $('chat-msgs').style.display = 'flex';
+    $('chat-empty-hint').style.display = 'none';
+    $('chat-loading').style.display = 'none';
+    $('msg-input').disabled = false;
+    $('msg-send').disabled = false;
+    $('msg-input').value = '';
+    $('msg-input').placeholder = '和 ' + name + ' 说点什么...';
+
+    if (isDesktop) {
+        // 确保在聊天模式
+        if (desktopTab !== 'chat') {
+            document.querySelectorAll('.sidebar-icon').forEach(i => {
+                i.classList.toggle('active', i.dataset.desktopTab === 'chat');
+            });
+        }
+        setDesktopMode('chat');
+        $('tab-chat-detail').style.display = 'flex';
+        $('nav-title').textContent = name || slug;
+        $('titlebar-app-name').textContent = name || slug;
+        $('nav-action-btn').style.display = 'block';
+        // 高亮联系人
+        document.querySelectorAll('.contact-item').forEach(c => {
+            c.classList.toggle('selected', c.dataset.slug === slug);
+        });
+    } else {
+        switchTab('chat-detail');
+    }
+    // 人物名和预览只保留在当前页面会话，避免同设备切换账号时读到旧资料。
+    // AI 生成内容标识随对话区一起显示（FR-021）
+    const aiNotice = $('ai-notice');
+    if (aiNotice) aiNotice.style.display = '';
+    memoryLoop.open(slug);
+    setTimeout(() => $('msg-input').focus(), 300);
+}
+
+// ═══════════════════════════════════════
+// 表情面板
+// ═══════════════════════════════════════
+
+let allStickers = [];
+let stickerCategory = 'all';
+
+async function loadStickers() {
+    try {
+        const data = await api('GET', '/stickers');
+        allStickers = data.stickers || [];
+        renderStickerGrid();
+    } catch(e) { /* 静默失败 */ }
+}
+
+function renderStickerGrid() {
+    const grid = $('sticker-grid');
+    if (!grid) return;
+    let filtered;
+    if (stickerCategory === 'all') {
+        filtered = allStickers;
+    } else if (stickerCategory === 'emoji') {
+        filtered = allStickers.filter(s => s.type === 'emoji');
+    } else if (stickerCategory === 'image') {
+        filtered = allStickers.filter(s => s.type === 'image' || s.type === 'gif');
+    } else if (stickerCategory === 'custom') {
+        filtered = allStickers.filter(s => s.source === 'custom');
+    } else {
+        filtered = allStickers.filter(s => s.emotion === stickerCategory || s.category === stickerCategory);
+    }
+    grid.innerHTML = filtered.map(s => {
+        if (s.type === 'emoji') {
+            return `<div class="sticker-item" data-id="${escHtml(s.id)}" data-type="emoji" title="${escHtml(s.label)}">${s.emoji || ''}</div>`;
+        }
+        const url = safeStickerUrl(s.url);
+        return `<div class="sticker-item" data-id="${escHtml(s.id)}" data-type="${escHtml(s.type)}" title="${escHtml(s.label)}"><img src="${escHtml(url)}" alt="${escHtml(s.label)}" class="sticker-thumb" loading="lazy"></div>`;
+    }).join('');
+
+    grid.querySelectorAll('.sticker-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const stickerId = item.dataset.id;
+            sendStickerMessage(stickerId);
+        });
+    });
+}
+
+async function sendStickerMessage(stickerId) {
+    if (!currentSlug || !memoryLoop.ready) return;
+    const view = memoryLoop.capture();
+    const controller = new AbortController();
+    memoryLoop.track(controller);
+    const panel = $('sticker-panel');
+    panel.style.display = 'none';
+    $('chat-msgs').classList.remove('has-panel');
+    $('sticker-toggle-btn').textContent = '😊';
+
+    const msgsEl = $('chat-msgs');
+    if ($('chat-empty-hint').style.display !== 'none') {
+        $('chat-empty-hint').style.display = 'none';
+        msgsEl.style.display = 'flex';
+    }
+
+    // 用户侧显示贴纸
+    const sticker = allStickers.find(s => s.id === stickerId);
+    const userRow = document.createElement('div');
+    userRow.className = 'msg-row user';
+    const userBubble = document.createElement('div');
+    userBubble.className = 'msg sticker';
+    if (sticker && sticker.type === 'emoji') {
+        userBubble.innerHTML = `<span class="sticker-img" style="font-size:60px;line-height:1.2;display:block;">${sticker.emoji || ''}</span>`;
+    } else if (sticker && (sticker.type === 'image' || sticker.type === 'gif')) {
+        const url = safeStickerUrl(sticker.url);
+        userBubble.innerHTML = `<img src="${escHtml(url)}" alt="${escHtml(sticker.label)}" class="sticker-bubble-img">`;
+    } else {
+        userBubble.textContent = `[贴纸]`;
+    }
+    userRow.appendChild(userBubble);
+    maybeAddTimestamp(msgsEl);
+    msgsEl.appendChild(userRow);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+
+    // 打字指示器
+    const typingRow = typingIndicator();
+    msgsEl.appendChild(typingRow);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+
+    try {
+        const resp = await fetch(`${API}/chat/stream`, {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({slug: view.slug, message: '', sticker_id: stickerId, conversation_id: view.conversationId}),
+            signal: controller.signal,
+        });
+        if (!memoryLoop.isCurrent(view)) { await resp.body?.cancel?.(); return; }
+        typingRow.remove();
+        await parseChatStream(resp, msgsEl, view);
+    } catch(e) {
+        if (!memoryLoop.isCurrent(view)) return;
+        typingRow.remove();
+        msgsEl.appendChild(sysMsg('消息发送失败，请重试'));
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+    } finally {
+        memoryLoop.untrack(controller);
+    }
+}
+
+// 贴纸上传
+$('sticker-upload-btn').addEventListener('click', () => {
+    $('sticker-file-input').click();
+});
+
+$('sticker-file-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('label', file.name.replace(/\.[^.]+$/, ''));
+    formData.append('category', 'custom');
+    try {
+        const resp = await fetch(`${API}/stickers/upload`, {
+            method: 'POST',
+            headers: authHeaders(false),
+            body: formData,
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            showToast(err.detail || '上传失败', 'error');
+            return;
+        }
+        showToast('贴纸上传成功', 'success');
+        await loadStickers();
+    } catch(e) {
+        showToast('上传失败，请检查网络', 'error');
+    }
+    e.target.value = '';
+});
+
+$('sticker-toggle-btn').addEventListener('click', () => {
+    const panel = $('sticker-panel');
+    const visible = panel.style.display !== 'none';
+    panel.style.display = visible ? 'none' : 'flex';
+    $('chat-msgs').classList.toggle('has-panel', !visible);
+    $('sticker-toggle-btn').textContent = visible ? '😊' : '⌨';
+    setTimeout(() => { $('chat-msgs').scrollTop = $('chat-msgs').scrollHeight; }, 100);
+});
+
+document.querySelectorAll('.sticker-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.sticker-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        stickerCategory = tab.dataset.category;
+        renderStickerGrid();
+    });
+});
+
+// ═══════════════════════════════════════
+// 发送消息 (流式)
+// ═══════════════════════════════════════
+
+async function sendMessage() {
+    const input = $('msg-input'), btn = $('msg-send');
+    const msg = input.value.trim();
+    if (!msg || !currentSlug || !memoryLoop.ready) return;
+    const view = memoryLoop.capture();
+    const controller = new AbortController();
+    memoryLoop.track(controller);
+
+    input.value = ''; input.disabled = true; btn.disabled = true;
+    const msgsEl = $('chat-msgs');
+    // 首次消息：隐藏空状态，显示消息区
+    if ($('chat-empty-hint').style.display !== 'none') {
+        $('chat-empty-hint').style.display = 'none';
+        msgsEl.style.display = 'flex';
+    }
+
+    maybeAddTimestamp(msgsEl);
+    const userRow = chatBubble('user', msg);
+    msgsEl.appendChild(userRow);
+    storeLastMessage(currentSlug, msg);
+
+    // 动画效果：消息发送后弹跳
+    animateMessageSend(userRow);
+
+    // 添加已读标记（初始为已发送）
+    const readStatus = document.createElement('div');
+    readStatus.className = 'msg-read-status';
+    readStatus.textContent = '已发送';
+    userRow.appendChild(readStatus);
+
+    // 离线时排队消息
+    if (false) {
+        enqueueOfflineMessage(currentSlug, msg);
+        msgsEl.appendChild(sysMsg('消息已保存，将在恢复网络后发送'));
+        input.disabled = false; btn.disabled = false;
+        input.focus();
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        return;
+    }
+
+    // 打字指示器
+    const typingRow = typingIndicator();
+    msgsEl.appendChild(typingRow);
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+
+    // 导航栏显示「对方正在输入...」
+    const navTitle = $('nav-title');
+    const origTitle = navTitle ? navTitle.textContent : '';
+    if (navTitle) navTitle.textContent = '对方正在输入...';
+
+    // 1秒后更新为「已送达」
+    setTimeout(() => {
+        readStatus.textContent = '已送达';
+    }, 1000);
+
+
+    try {
+        const res = await fetch(`${API}/chat/stream`, {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({slug: view.slug, message: msg, conversation_id: view.conversationId}),
+            signal: controller.signal,
+        });
+
+        if (!memoryLoop.isCurrent(view)) { await res.body?.cancel?.(); return; }
+
+        // 模拟对方"看到消息后思考"的延迟（1-3秒）
+        await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+        if (!memoryLoop.isCurrent(view)) { await res.body?.cancel?.(); return; }
+        typingRow.remove();
+        if (navTitle) navTitle.textContent = origTitle;
+        const reply = await parseChatStream(res, msgsEl, view);
+        if (!memoryLoop.isCurrent(view)) return;
+
+        // 更新已读状态
+        readStatus.textContent = '已读';
+        readStatus.classList.add('read');
+
+        // 添加重新生成按钮到最后一条助手消息
+        if (reply) addRegenerateButton(msgsEl);
+    } catch(e) {
+        if (!memoryLoop.isCurrent(view)) return;
+        typingRow.remove();
+        if (navTitle) navTitle.textContent = origTitle;
+        msgsEl.appendChild(sysMsg(e.message));
+    } finally {
+        memoryLoop.untrack(controller);
+        if (memoryLoop.isCurrent(view)) {
+            input.disabled = false; btn.disabled = false;
+            input.focus();
+            msgsEl.scrollTop = msgsEl.scrollHeight;
+        }
+    }
+}
+
+function noticeMsg(notice) {
+    // 危机干预与内容拦截都以平台身份呈现，绝不能渲染成镜像说的话。
+    // 复用既有 sys 样式，不新增 CSS class（app.js 与 style.css 之间是隐式契约）。
+    const row = document.createElement('div');
+    row.className = 'msg-row sys';
+    const div = document.createElement('div');
+    div.className = 'msg';
+    const lines = [notice.message || ''];
+    (notice.hotlines || []).forEach(h => {
+        if (h && h.number) lines.push(`${h.name || '求助热线'}：${h.number}${h.hours ? '（' + h.hours + '）' : ''}`);
+    });
+    if (notice.followup) lines.push(notice.followup);
+    div.textContent = lines.filter(Boolean).join('\n');
+    div.style.whiteSpace = 'pre-wrap';
+    row.appendChild(div);
+    return row;
+}
+
+function sysMsg(text) {
+    const row = document.createElement('div');
+    row.className = 'msg-row sys';
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.textContent = text;
+    row.appendChild(div);
+    return row;
+}
+
+function buildHistory(msgsEl) {
+    const hist = [];
+    const rows = msgsEl.querySelectorAll('.msg-row');
+    let u = null;
+    rows.forEach(row => {
+        if (row.classList.contains('sys') || row.classList.contains('sticker')) return;
+        const msgEl = row.querySelector('.msg');
+        if (!msgEl) return;
+        if (row.classList.contains('user')) { u = msgEl.textContent; }
+        else if (row.classList.contains('assistant') && u) {
+            hist.push({role:'user', content:u});
+            hist.push({role:'assistant', content:msgEl.textContent});
+            u = null;
+        }
+    });
+    return hist;
+}
+
+function storeLastMessage(slug, text) {
+    const preview = text.replace(/\n/g, ' ').slice(0, 50);
+    messagePreviews.set(slug, preview);
+}
+
+function getLastMessage(slug) {
+    return messagePreviews.get(slug) || '';
+}
+
+function addRegenerateButton(msgsEl) {
+    // 移除旧的重新生成按钮
+    const oldBtn = msgsEl.querySelector('.regenerate-btn');
+    if (oldBtn) oldBtn.remove();
+
+    // 找到最后一条助手消息
+    const rows = msgsEl.querySelectorAll('.msg-row.assistant');
+    if (rows.length === 0) return;
+    const lastRow = rows[rows.length - 1];
+
+    const btn = document.createElement('button');
+    btn.className = 'regenerate-btn';
+    btn.textContent = '🔄 重新生成';
+    btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = '生成中…';
+        // 删除最后一条助手消息
+        lastRow.remove();
+        // 重新发送最后一条用户消息
+        const userRows = msgsEl.querySelectorAll('.msg-row.user');
+        if (userRows.length > 0) {
+            const lastUserMsg = userRows[userRows.length - 1].querySelector('.msg').textContent;
+            $('msg-input').value = lastUserMsg;
+            await sendMessage();
+        }
+    };
+    lastRow.appendChild(btn);
+}
+
+// ═══════════════════════════════════════
+// 虚拟滚动管理器
+// ═══════════════════════════════════════
+
+class VirtualScrollManager {
+    constructor(container, itemHeight = 60, bufferSize = 10) {
+        this.container = container;
+        this.itemHeight = itemHeight;
+        this.bufferSize = bufferSize;
+        this.items = [];
+        this.visibleItems = new Map();
+        this.observer = null;
+        this.init();
+    }
+
+    init() {
+        // 使用 IntersectionObserver 监控可见区域
+        this.observer = new IntersectionObserver(
+            (entries) => {
+                entries.forEach(entry => {
+                    const id = entry.target.dataset.virtualId;
+                    if (entry.isIntersecting) {
+                        this.visibleItems.set(id, entry.target);
+                    } else {
+                        this.visibleItems.delete(id);
+                    }
+                });
+            },
+            { root: this.container, rootMargin: '100px' }
+        );
+    }
+
+    addElement(el, id) {
+        el.dataset.virtualId = id;
+        this.items.push({ el, id });
+        this.observer.observe(el);
+    }
+
+    clear() {
+        this.items.forEach(item => this.observer.unobserve(item.el));
+        this.items = [];
+        this.visibleItems.clear();
+    }
+
+    getVisibleCount() {
+        return this.visibleItems.size;
+    }
+}
+
+// 全局虚拟滚动实例
+let virtualScroll = null;
+
+// DOM 批量操作工具
+const DOMBatch = {
+    fragment: null,
+
+    startBatch() {
+        this.fragment = document.createDocumentFragment();
+    },
+
+    appendToBatch(el) {
+        if (this.fragment) {
+            this.fragment.appendChild(el);
+        }
+    },
+
+    commitBatch(target) {
+        if (this.fragment && target) {
+            target.appendChild(this.fragment);
+            this.fragment = null;
+        }
+    }
+};
+
+// 性能监控
+const PerfMonitor = {
+    marks: new Map(),
+
+    start(name) {
+        this.marks.set(name, performance.now());
+    },
+
+    end(name) {
+        const start = this.marks.get(name);
+        if (start) {
+            const duration = performance.now() - start;
+            this.marks.delete(name);
+            if (duration > 100) {
+                console.warn(`[Perf] ${name}: ${duration.toFixed(2)}ms`);
+            }
+            return duration;
+        }
+        return 0;
+    }
+};
+
+function chatBubble(role, text) {
+    const row = document.createElement('div');
+    row.className = 'msg-row ' + role;
+    row.dataset.timestamp = Date.now();
+
+    if (role === 'assistant' && currentName) {
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar';
+        avatar.style.background = avatarColor(currentSlug);
+        avatar.textContent = (currentName || currentSlug)[0];
+        row.appendChild(avatar);
+    }
+
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.textContent = text;
+    row.appendChild(div);
+
+    // 长按/右键菜单
+    div.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        showMsgMenu(row, e);
+    });
+    // 移动端长按
+    let longPressTimer;
+    div.addEventListener('touchstart', (e) => {
+        longPressTimer = setTimeout(() => {
+            showMsgMenu(row, e.touches[0]);
+        }, 500);
+    }, {passive: true});
+    div.addEventListener('touchend', () => clearTimeout(longPressTimer));
+    div.addEventListener('touchmove', () => clearTimeout(longPressTimer));
+
+    return row;
+}
+
+// ── 消息操作菜单 ──
+let currentMenuRow = null;
+let quoteMode = false;
+
+function showMsgMenu(row, e) {
+    currentMenuRow = row;
+    const isUser = row.classList.contains('user');
+    const isSys = row.classList.contains('sys');
+    if (isSys) return;
+
+    const msgEl = row.querySelector('.msg');
+    const text = msgEl ? msgEl.textContent : '';
+
+    // 创建菜单
+    let menu = $('msg-action-menu');
+    if (!menu) {
+        menu = document.createElement('div');
+        menu.id = 'msg-action-menu';
+        menu.className = 'msg-action-menu';
+        menu.style.display = 'none';
+        document.body.appendChild(menu);
+    }
+
+    const options = [
+        {label: '📋 复制', action: () => {
+            navigator.clipboard.writeText(text);
+            showToast('已复制到剪贴板', 'success');
+        }},
+        {label: '↩️ 引用', action: () => startQuote(text) },
+        {label: '💬 回复', action: () => {
+            const input = $('msg-input');
+            input.value = `@${currentName || currentSlug} `;
+            input.focus();
+        }},
+    ];
+    if (isUser) {
+        const age = Date.now() - parseInt(row.dataset.timestamp || '0');
+        if (age < 2 * 60 * 1000) { // 2 分钟内可撤回
+            options.push({label: '🗑️ 撤回', action: () => recallMessage(row), danger: true});
+        }
+    }
+
+    menu.innerHTML = options.map(o =>
+        `<button class="msg-menu-item${o.danger ? ' danger' : ''}">${o.label}</button>`
+    ).join('');
+    menu.querySelectorAll('.msg-menu-item').forEach((btn, i) => {
+        btn.onclick = () => { menu.style.display = 'none'; options[i].action(); };
+    });
+
+    // 定位菜单
+    const x = Math.min(e.clientX || 100, window.innerWidth - 140);
+    const y = Math.min(e.clientY || 100, window.innerHeight - 160);
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+    menu.style.display = 'flex';
+}
+
+// 点击其他地方关闭菜单
+document.addEventListener('click', () => {
+    const menu = $('msg-action-menu');
+    if (menu) menu.style.display = 'none';
+});
+
+// ── 动画增强：消息发送后气泡弹跳 ──
+function animateMessageSend(row) {
+    row.style.animation = 'none';
+    row.offsetHeight; // 触发重绘
+    row.style.animation = 'msgBounceIn 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275)';
+}
+
+// ── 动画增强：Tab 切换 ──
+function animateTabSwitch(el) {
+    el.style.animation = 'none';
+    el.offsetHeight;
+    el.style.animation = 'fadeInUp 0.3s ease-out forwards';
+}
+
+// ── 动画增强：按钮点击波纹效果 ──
+function addRippleEffect(button) {
+    button.addEventListener('click', function(e) {
+        const ripple = document.createElement('span');
+        ripple.className = 'ripple-effect';
+        const rect = this.getBoundingClientRect();
+        const size = Math.max(rect.width, rect.height);
+        ripple.style.width = ripple.style.height = size + 'px';
+        ripple.style.left = e.clientX - rect.left - size/2 + 'px';
+        ripple.style.top = e.clientY - rect.top - size/2 + 'px';
+        this.appendChild(ripple);
+        setTimeout(() => ripple.remove(), 600);
+    });
+}
+
+// ── 动画增强：滚动到视图中间 ──
+function scrollToCenter(el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function startQuote(text) {
+    const input = $('msg-input');
+    const preview = text.replace(/\n/g, ' ').slice(0, 50);
+    const quotePreview = $('quote-preview');
+
+    // 显示引用预览
+    if (quotePreview) {
+        quotePreview.innerHTML = `
+            <div class="quote-preview-content">
+                <div class="quote-preview-text">引用: ${escHtml(preview)}${text.length > 50 ? '...' : ''}</div>
+                <button class="quote-preview-close" onclick="clearQuote()">×</button>
+            </div>`;
+        quotePreview.style.display = 'block';
+    }
+
+    input.value = '';
+    input.focus();
+    quoteMode = true;
+    input.placeholder = '回复引用的消息...';
+}
+
+function clearQuote() {
+    const quotePreview = $('quote-preview');
+    if (quotePreview) quotePreview.style.display = 'none';
+    quoteMode = false;
+    const input = $('msg-input');
+    input.placeholder = '';
+}
+
+function recallMessage(row) {
+    const msgEl = row.querySelector('.msg');
+    if (msgEl) {
+        msgEl.textContent = '你撤回了一条消息';
+        msgEl.className = 'msg sys recalled-msg';
+        row.className = 'msg-row sys';
+    }
+    showToast('消息已撤回', 'info');
+}
+
+function typingIndicator() {
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    if (currentName) {
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar';
+        avatar.style.background = avatarColor(currentSlug);
+        avatar.textContent = (currentName || currentSlug)[0];
+        row.appendChild(avatar);
+    }
+    const typing = document.createElement('div');
+    typing.className = 'typing-indicator';
+    typing.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+    row.appendChild(typing);
+    return row;
+}
+
+function avatarColor(slug) {
+    const colors = ['#07C160','#FA9C3C','#576B95','#FA5151','#1485EE','#E67E22'];
+    let hash = 0;
+    for (let i = 0; i < (slug||'a').length; i++) hash = slug.charCodeAt(i) + ((hash << 5) - hash);
+    return colors[Math.abs(hash) % colors.length];
+}
+
+function stickerMsg(stickerId) {
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant sticker';
+    if (currentName) {
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar';
+        avatar.style.background = avatarColor(currentSlug);
+        avatar.textContent = (currentName || currentSlug)[0];
+        row.appendChild(avatar);
+    }
+    const div = document.createElement('div');
+    div.className = 'msg sticker';
+    const sticker = allStickers.find(s => s.id === stickerId);
+    if (sticker && (sticker.type === 'image' || sticker.type === 'gif')) {
+        const url = safeStickerUrl(sticker.url);
+        div.innerHTML = `<img src="${escHtml(url)}" alt="${escHtml(sticker.label)}" class="sticker-bubble-img">`;
+    } else {
+        const emojiMap = {};
+        allStickers.forEach(s => { if (s.emoji) emojiMap[s.id] = s.emoji; });
+        const emoji = (sticker && sticker.emoji) || emojiMap[stickerId] || '😊';
+        div.innerHTML = `<span class="sticker-img" style="font-size:60px;line-height:1.2;display:block;">${emoji}</span>`;
+    }
+    row.appendChild(div);
+    return row;
+}
+
+$('msg-send').addEventListener('click', sendMessage);
+addRippleEffect($('msg-send'));
+$('msg-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// ═══════════════════════════════════════
+// 通讯录
+// ═══════════════════════════════════════
+
+function showContactProfile() {
+    const el = $('contact-profile');
+    if (!currentSlug) {
+        el.innerHTML = '<p class="list-empty">请先在聊天列表选择镜像</p>';
+        return;
+    }
+    api('GET', '/exes').then(exes => {
+        const exe = exes.find(e => e.slug === currentSlug);
+        if (!exe) { el.innerHTML = '<p class="list-empty">镜像不存在</p>'; return; }
+        el.innerHTML = `
+            <div class="profile-card">
+                <div class="profile-avatar">${(exe.name || exe.slug)[0]}</div>
+                <div class="profile-name">${escHtml(exe.name)}</div>
+                <div class="profile-id">ID: ${escHtml(exe.slug)}</div>
+                <div class="profile-signature">${escHtml(exe.state === 'completed' ? '基于聊天记录的 AI 模拟镜像' : '构建中...')}</div>
+                <button class="profile-moments-btn" onclick="viewMoments()">朋友圈</button>
+            </div>
+        `;
+    }).catch(() => {
+        el.innerHTML = '<p class="list-empty">加载失败</p>';
+    });
+}
+
+// ═══════════════════════════════════════
+// 朋友圈
+// ═══════════════════════════════════════
+
+let viewingMoments = false;
+
+window.setDiscoverFeature = activeId => {
+    document.querySelectorAll('.discover-feature-card').forEach(card => {
+        const active = card.id === activeId;
+        card.classList.toggle('active', active);
+        card.setAttribute('aria-expanded', String(active));
+    });
+};
+
+$('moments-entry').addEventListener('click', () => {
+    const timeline = $('moments-timeline');
+    viewingMoments = timeline.style.display !== 'block';
+    timeline.style.display = viewingMoments ? 'block' : 'none';
+    $('chat-helper-panel').style.display = 'none';
+    window.setDiscoverFeature(viewingMoments ? 'moments-entry' : null);
+    if (viewingMoments) loadMoments();
+});
+
+function viewMoments() {
+    if (isDesktop) {
+        // 桌面端切换到发现模式
+        document.querySelectorAll('.sidebar-icon').forEach(i => {
+            i.classList.toggle('active', i.dataset.desktopTab === 'discover');
+        });
+        setDesktopMode('discover');
+    } else {
+        switchTab('discover');
+    }
+    viewingMoments = true;
+    $('chat-helper-panel').style.display = 'none';
+    $('moments-timeline').style.display = 'block';
+    window.setDiscoverFeature('moments-entry');
+    loadMoments();
+}
+
+async function loadMoments() {
+    const el = $('moments-list');
+    if (!currentSlug) {
+        el.innerHTML = '<p style="color:#888;text-align:center;padding:40px 0;">请先选择一个镜像</p>';
+        return;
+    }
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/moments`);
+        const moments = data.moments || [];
+        if (!moments.length) {
+            el.innerHTML = '<p style="color:#888;text-align:center;padding:40px 0;">ta 还没有发朋友圈</p>';
+            return;
+        }
+        el.innerHTML = moments.map(m => `
+            <div class="moment-item">
+                <div class="moment-avatar">${(currentName || currentSlug)[0]}</div>
+                <div class="moment-body">
+                    <div class="moment-name">${escHtml(currentName || currentSlug)}</div>
+                    <div class="moment-content">${escHtml(m.content)}</div>
+                    <div class="moment-time">${escHtml(m.created_at || '')}</div>
+                </div>
+            </div>
+        `).join('');
+    } catch(e) {
+        el.innerHTML = '<p style="color:#888;text-align:center;padding:40px 0;">朋友圈暂不可用</p>';
+    }
+}
+
+// ═══════════════════════════════════════
+// 钱包入口
+// ═══════════════════════════════════════
+
+$('wallet-entry').addEventListener('click', () => {
+    if (!currentSlug) { showToast('请先在聊天中选择一个镜像', 'warning'); return; }
+    switchTab('wallet');
+});
+
+$('create-entry').addEventListener('click', () => {
+    switchTab('create');
+});
+$('create-entry').addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        switchTab('create');
+    }
+});
+
+$('logout-entry').addEventListener('click', () => {
+    if (confirm('确定退出登录？')) logout();
+});
+
+function clearModelSecrets() {
+    for (const kind of ['llm', 'embedding']) {
+        const key = $(`settings-${kind}-key`);
+        if (key) key.value = '';
+        const deletion = $(`settings-${kind}-delete`);
+        if (deletion) deletion.checked = false;
+    }
+}
+
+function resetModelSettings() {
+    modelSettingsOperation += 1;
+    accountModelSettings = null;
+    modelSettingsBusy = false;
+    clearModelSecrets();
+    for (const kind of ['llm', 'embedding']) {
+        $(`settings-${kind}-model`).value = '';
+        $(`settings-${kind}-base-url`).value = '';
+        $(`settings-${kind}-key-status`).textContent = '尚未读取配置';
+    }
+    $('model-settings-status').textContent = '请读取当前账号的模型配置';
+    $('model-settings-result').textContent = '';
+    updateModelSettingsControls();
+}
+
+function updateModelSettingsControls() {
+    const disabled = modelSettingsBusy || !accountModelSettings;
+    for (const kind of ['llm', 'embedding']) {
+        const locked = kind === 'embedding' && accountModelSettings?.embedding.locked;
+        for (const field of ['provider', 'model', 'base-url']) $(`settings-${kind}-${field}`).disabled = disabled || !!locked;
+        $(`settings-${kind}-key`).disabled = disabled;
+        $(`settings-${kind}-delete`).disabled = disabled || !accountModelSettings?.[kind].has_key;
+        const provider = $(`settings-${kind}-provider`).value;
+        $(`settings-${kind}-protocol-hint`).hidden = kind === 'llm'
+            ? !['anthropic', 'custom_anthropic'].includes(provider)
+            : !['gemini', 'custom_gemini'].includes(provider);
+        $(`settings-${kind}-url-row`).hidden = !window.ExMemoryModelSettings.isCustom(provider);
+        $(`settings-${kind}-url-hint`).textContent = window.ExMemoryModelSettings.addressHint(provider);
+        $(`settings-${kind}-base-url`).placeholder = provider === 'custom_gemini' ? 'https://api.example.com/v1beta' : 'https://api.example.com/v1';
+    }
+    $('model-settings-save').disabled = disabled;
+    $('model-settings-reload').disabled = modelSettingsBusy;
+    $('model-settings-continue').hidden = !accountModelSettings?.storage_available || !accountModelSettings?.llm.has_key || !accountModelSettings?.embedding.has_key;
+}
+
+function renderModelSettings(settings) {
+    accountModelSettings = settings;
+    clearModelSecrets();
+    for (const kind of ['llm', 'embedding']) {
+        const value = settings[kind];
+        $(`settings-${kind}-provider`).value = value.provider;
+        $(`settings-${kind}-base-url`).value = value.base_url || '';
+        $(`settings-${kind}-model`).value = value.model;
+        $(`settings-${kind}-key-status`).textContent = window.ExMemoryModelSettings.keyLabel(value);
+        $(`settings-${kind}-locked`).hidden = !value.locked;
+        $(`settings-${kind}-locked`).textContent = value.locked_reason || '';
+    }
+    $('model-settings-status').textContent = settings.storage_available
+        ? '这是当前账号的配置。留空会保留已保存的 Key；保存后会用于后续请求，已发出的请求可能继续完成。'
+        : '服务暂时无法安全保存或使用 Key，请稍后重试；仍可删除已保存的 Key。';
+    updateModelSettingsControls();
+}
+
+async function loadModelSettings() {
+    if (modelSettingsBusy) return;
+    const epoch = authEpoch;
+    const operation = ++modelSettingsOperation;
+    modelSettingsBusy = true;
+    clearModelSecrets();
+    $('model-settings-result').textContent = '';
+    updateModelSettingsControls();
+    try {
+        const settings = await api('GET', '/account/model-settings');
+        if (epoch !== authEpoch || operation !== modelSettingsOperation) return;
+        renderModelSettings(settings);
+    } catch (error) {
+        if (epoch !== authEpoch || operation !== modelSettingsOperation) return;
+        accountModelSettings = null;
+        $('model-settings-result').textContent = `读取失败：${error.message}`;
+    } finally {
+        if (epoch === authEpoch && operation === modelSettingsOperation) {
+            modelSettingsBusy = false;
+            updateModelSettingsControls();
+        }
+    }
+}
+
+for (const entry of ['model-settings-entry', 'import-model-settings']) {
+    $(entry).addEventListener('click', () => switchTab('models'));
+}
+$('model-settings-entry').addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); switchTab('models'); }
+});
+$('model-settings-reload').addEventListener('click', loadModelSettings);
+$('model-settings-continue').addEventListener('click', () => switchTab('create'));
+for (const kind of ['llm', 'embedding']) {
+    $(`settings-${kind}-provider`).addEventListener('change', () => {
+        const provider = $(`settings-${kind}-provider`).value;
+        const saved = accountModelSettings?.[kind];
+        $(`settings-${kind}-base-url`).value = provider === saved?.provider ? saved.base_url || '' : '';
+        $(`settings-${kind}-model`).value = provider === saved?.provider ? saved.model
+            : kind === 'llm' && provider === 'deepseek' ? 'deepseek-chat'
+            : kind === 'embedding' && provider === 'siliconflow' ? 'BAAI/bge-m3' : '';
+        $(`settings-${kind}-key`).value = '';
+        $(`settings-${kind}-delete`).checked = false;
+        updateModelSettingsControls();
+    });
+}
+$('model-settings-save').addEventListener('click', async () => {
+    if (modelSettingsBusy || !accountModelSettings) return;
+    const epoch = authEpoch;
+    const operation = ++modelSettingsOperation;
+    const output = $('model-settings-result');
+    const values = Object.fromEntries(['llm', 'embedding'].map(kind => [kind, {
+        provider: $(`settings-${kind}-provider`).value,
+        model: $(`settings-${kind}-model`).value,
+        base_url: $(`settings-${kind}-base-url`).value,
+        api_key: $(`settings-${kind}-key`).value,
+        delete_key: $(`settings-${kind}-delete`).checked,
+    }]));
+    try {
+        const body = window.ExMemoryModelSettings.payload(accountModelSettings, values);
+        if (!accountModelSettings.storage_available && Object.values(values).some(value => value.api_key.trim())) throw new Error('服务暂时无法安全保存新 Key，请稍后重试');
+        modelSettingsBusy = true;
+        output.textContent = '正在保存…'; output.style.color = 'var(--text-secondary)';
+        updateModelSettingsControls();
+        const settings = await api('PUT', '/account/model-settings', body, 0);
+        if (epoch !== authEpoch || operation !== modelSettingsOperation) return;
+        renderModelSettings(settings);
+        invalidateImportConfig();
+        output.textContent = '已保存到当前账号。Key 未回显；实际连接将在导入或对话时验证。';
+        output.style.color = 'var(--chat-green)';
+    } catch (error) {
+        if (epoch !== authEpoch || operation !== modelSettingsOperation) return;
+        output.textContent = `保存未完成：${error.message}。如结果不确定或配置已变更，请重新读取后再试。`;
+        output.style.color = 'var(--red)';
+    } finally {
+        for (const value of Object.values(values)) value.api_key = '';
+        if (epoch === authEpoch && operation === modelSettingsOperation) {
+            clearModelSecrets();
+            modelSettingsBusy = false;
+            updateModelSettingsControls();
+        }
+    }
+});
+
+// ═══════════════════════════════════════
+// 关系阶段管理
+// ═══════════════════════════════════════
+
+const STAGE_LABELS = {
+    source: '依据记录',
+    dating: '热恋期 💕',
+    conflicted: '磨合期 ⚡',
+    broken: '分手期 💔',
+    healing: '治愈期 🌱',
+};
+
+async function loadStage() {
+    if (!currentSlug) return;
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/stage`);
+        updateStageUI(data.stage);
+    } catch(e) { /* ignore */ }
+}
+
+function updateStageUI(stage) {
+    const el = $('stage-indicator');
+    if (el) el.textContent = STAGE_LABELS[stage] || stage;
+}
+
+async function setStage(stage) {
+    if (!currentSlug) return;
+    try {
+        await api('PUT', `/exes/${currentSlug}/stage?stage=${stage}`);
+        updateStageUI(stage);
+        showToast(`关系阶段已切换为「${STAGE_LABELS[stage]}」`, 'success');
+    } catch(e) {
+        showToast('切换失败: ' + e.message, 'error');
+    }
+}
+
+async function checkStageSuggestion() {
+    if (!currentSlug) return;
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/stage/suggest`);
+        if (data.suggestion && data.suggestion !== data.current_stage) {
+            // 在聊天中显示建议
+            const msgsEl = $('chat-msgs');
+            if (msgsEl && msgsEl.style.display !== 'none') {
+                const row = document.createElement('div');
+                row.className = 'msg-row sys';
+                row.innerHTML = `<div class="msg stage-suggestion">💡 ${escHtml(data.reason)}，要切换到「${STAGE_LABELS[data.suggestion]}」吗？ <button class="stage-accept-btn" onclick="setStage('${data.suggestion}')">切换</button></div>`;
+                msgsEl.appendChild(row);
+                msgsEl.scrollTop = msgsEl.scrollHeight;
+            }
+        }
+    } catch(e) { /* ignore */ }
+}
+
+// ═══════════════════════════════════════
+// 对话搜索
+// ═══════════════════════════════════════
+
+async function searchMessages(query) {
+    if (!currentSlug || !query.trim()) return [];
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/messages/search?q=${encodeURIComponent(query)}`);
+        const results = data.results || [];
+
+        // 高亮显示搜索结果
+        if (results.length > 0) {
+            const msgsEl = $('chat-msgs');
+            if (msgsEl) {
+                // 清除旧高亮
+                msgsEl.querySelectorAll('.search-highlight').forEach(el => {
+                    el.outerHTML = el.textContent;
+                });
+                // 添加新高亮
+                results.forEach(result => {
+                    const rows = msgsEl.querySelectorAll('.msg-row');
+                    rows.forEach(row => {
+                        const msg = row.querySelector('.msg');
+                        if (msg && msg.textContent.includes(query)) {
+                            const regex = new RegExp(`(${query})`, 'gi');
+                            msg.innerHTML = msg.textContent.replace(regex, '<mark class="search-highlight">$1</mark>');
+                        }
+                    });
+                });
+                // 滚动到第一个匹配
+                const firstMatch = msgsEl.querySelector('.search-highlight');
+                if (firstMatch) scrollToCenter(firstMatch);
+            }
+        }
+
+        return results;
+    } catch(e) {
+        return [];
+    }
+}
+
+// ═══════════════════════════════════════
+// 对话截图与分享
+// ═══════════════════════════════════════
+
+async function generateScreenshot() {
+    const msgsEl = $('chat-msgs');
+    if (!msgsEl || msgsEl.style.display === 'none') {
+        showToast('请先打开对话', 'warning');
+        return;
+    }
+
+    // 显示加载状态
+    const loadingEl = document.createElement('div');
+    loadingEl.className = 'loading-overlay';
+    loadingEl.innerHTML = '<div class="loading-spinner"></div><div class="loading-text">正在生成截图...</div>';
+    document.body.appendChild(loadingEl);
+
+    try {
+        // 动态加载 html2canvas
+        if (!window.html2canvas) {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';
+            document.head.appendChild(script);
+            await new Promise((resolve, reject) => {
+                script.onload = resolve;
+                script.onerror = reject;
+            });
+        }
+
+        const canvas = await window.html2canvas(msgsEl, {
+            backgroundColor: '#0a0a12',
+            scale: 2,
+            useCORS: true,
+        });
+
+        // 下载截图
+        const link = document.createElement('a');
+        link.download = `ex-memory-${currentSlug || 'chat'}-${Date.now()}.png`;
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+
+        loadingEl.remove();
+        showToast('截图已保存到本地', 'success');
+    } catch(e) {
+        loadingEl.remove();
+        showToast('截图失败: ' + e.message, 'error');
+    }
+}
+
+async function generateShareLink() {
+    if (!currentSlug) {
+        showToast('请先选择一个镜像', 'warning');
+        return;
+    }
+
+    try {
+        const data = await api('POST', `/exes/${currentSlug}/share`);
+        if (data.url) {
+            // 复制链接
+            await navigator.clipboard.writeText(data.url);
+            showToast('分享链接已复制', 'success');
+        }
+    } catch(e) {
+        showToast('生成分享链接失败', 'error');
+    }
+}
+
+// ═══════════════════════════════════════
+// 对话统计
+// ═══════════════════════════════════════
+
+async function loadStats() {
+    if (!currentSlug) {
+        showToast('请先选择一个镜像', 'warning');
+        return;
+    }
+    try {
+        const [stats, emotion, temperature] = await Promise.all([
+            api('GET', `/exes/${currentSlug}/stats`),
+            api('GET', `/exes/${currentSlug}/emotion`).catch(() => ({analysis: {overall: {score: 0}}, curve: []})),
+            api('GET', `/exes/${currentSlug}/relationship-temperature`).catch(() => ({temperature: {temperature: 50, level: 'warm'}})),
+        ]);
+
+        const temp = temperature.temperature || {};
+        const tempLevel = temp.level || 'warm';
+        const tempValue = temp.temperature || 50;
+        const tempEmoji = {hot: '🔥', warm: '☀️', cool: '🌤️', cold: '❄️'}[tempLevel] || '☀️';
+
+        const el = $('chat-msgs');
+        el.style.display = 'block';
+        el.innerHTML = `
+            <div class="stats-container">
+                <h3 class="stats-title">对话统计</h3>
+
+                <!-- 关系温度 -->
+                <div class="relationship-temperature">
+                    <div class="temp-display">
+                        <div class="temp-emoji">${tempEmoji}</div>
+                        <div class="temp-value">${tempValue}°</div>
+                        <div class="temp-label">关系温度</div>
+                    </div>
+                    <div class="temp-bar">
+                        <div class="temp-fill" style="width: ${tempValue}%"></div>
+                    </div>
+                    <div class="temp-desc">${getTemperatureDesc(tempLevel)}</div>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.total_messages}</div>
+                        <div class="stat-label">总消息数</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.user_messages}</div>
+                        <div class="stat-label">你发送的</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${stats.assistant_messages}</div>
+                        <div class="stat-label">TA 回复的</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value">${Math.round((emotion.analysis?.overall?.score || 0) * 100)}%</div>
+                        <div class="stat-label">情感指数</div>
+                    </div>
+                </div>
+
+                <!-- 情感曲线 -->
+                <h4 class="stats-subtitle">情感曲线</h4>
+                <div class="emotion-curve-container">
+                    <canvas id="emotion-canvas" width="400" height="120"></canvas>
+                </div>
+
+                <!-- 活跃时段 -->
+                <h4 class="stats-subtitle">活跃时段</h4>
+                <div class="stats-periods">
+                    ${Object.entries(stats.time_periods || {}).map(([period, count]) => `
+                        <div class="period-bar">
+                            <span class="period-label">${period}</span>
+                            <div class="period-fill" style="width: ${Math.min(count * 5, 100)}%"></div>
+                            <span class="period-count">${count}</span>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>`;
+
+        // 绘制情感曲线
+        drawEmotionCurve(emotion.curve || []);
+        $('chat-empty-hint').style.display = 'none';
+    } catch(e) {
+        showToast('加载统计失败: ' + e.message, 'error');
+    }
+}
+
+function getTemperatureDesc(level) {
+    const descs = {
+        'hot': '你们的关系很亲密，充满了爱和温暖',
+        'warm': '你们的关系还不错，有温馨的互动',
+        'cool': '你们的关系有些冷淡，需要更多关心',
+        'cold': '你们的关系很疏远，需要努力修复',
+    };
+    return descs[level] || descs.warm;
+}
+
+function drawEmotionCurve(curve) {
+    const canvas = $('emotion-canvas');
+    if (!canvas || curve.length === 0) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    const padding = 20;
+
+    ctx.clearRect(0, 0, w, h);
+
+    // 背景网格
+    ctx.strokeStyle = 'rgba(124, 108, 255, 0.08)';
+    ctx.lineWidth = 1;
+    for (let y = padding; y <= h - padding; y += 30) {
+        ctx.beginPath();
+        ctx.moveTo(padding, y);
+        ctx.lineTo(w - padding, y);
+        ctx.stroke();
+    }
+
+    // 中线（0 分）
+    ctx.strokeStyle = 'rgba(124, 108, 255, 0.2)';
+    ctx.beginPath();
+    ctx.moveTo(padding, h / 2);
+    ctx.lineTo(w - padding, h / 2);
+    ctx.stroke();
+
+    // 情感曲线
+    const stepX = (w - 2 * padding) / Math.max(curve.length - 1, 1);
+    ctx.strokeStyle = '#7c6cff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    curve.forEach((point, i) => {
+        const x = padding + i * stepX;
+        const y = h / 2 - point.score * (h / 2 - padding) * 0.8;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // 填充区域
+    ctx.lineTo(padding + (curve.length - 1) * stepX, h / 2);
+    ctx.lineTo(padding, h / 2);
+    ctx.closePath();
+    const gradient = ctx.createLinearGradient(0, 0, 0, h);
+    gradient.addColorStop(0, 'rgba(124, 108, 255, 0.15)');
+    gradient.addColorStop(0.5, 'rgba(124, 108, 255, 0.02)');
+    gradient.addColorStop(1, 'rgba(124, 108, 255, 0.15)');
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    // 标签
+    ctx.fillStyle = 'rgba(122, 116, 144, 0.6)';
+    ctx.font = '10px -apple-system';
+    ctx.textAlign = 'right';
+    ctx.fillText('正面', padding - 4, padding + 4);
+    ctx.fillText('负面', padding - 4, h - padding + 4);
+}
+
+// ═══════════════════════════════════════
+// 创建镜像
+// ═══════════════════════════════════════
+
+let importConfig = null;
+let importConfigPromise = null;
+let importConfigOperation = 0;
+function invalidateImportConfig() {
+    importConfigOperation += 1;
+    importConfig = null;
+    importConfigPromise = null;
+}
+const importFlow = new window.ExMemoryImportFlow({
+    request: (method, path, body) => api(method, path, body, method === 'GET' ? 1 : 0),
+    createSlug: () => 'mirror_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+    onProgress: message => {
+        $('create-result').textContent = message;
+        $('create-result').style.color = 'var(--text-secondary)';
+    },
+    upload: async (slug, file, targetName) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('target_name', targetName);
+        const headers = token ? { Authorization: `Bearer ${token}` } : {};
+        const response = await fetch(`${API}/exes/${slug}/import`, {
+            method: 'POST', headers, body: formData, signal: AbortSignal.timeout(120000),
+        });
+        if (response.status === 401) { logout(); throw new Error('登录已过期，请重新登录'); }
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `导入失败 (${response.status})`);
+        return data;
+    },
+});
+
+function updateImportControls() {
+    const busy = importFlow.busy;
+    const waiting = !!importFlow.taskId;
+    const done = importFlow.completed;
+    for (const id of ['create-file', 'create-target', 'create-consent']) $(id).disabled = busy || waiting || done;
+    for (const id of ['create-name', 'create-basic', 'create-personality']) $(id).disabled = busy || !!importFlow.draft;
+    const configured = importConfig?.llm_configured && importConfig?.embedding_configured;
+    $('create-submit').disabled = busy || done || (!waiting && !importFlow.needsReconcile && !configured);
+    $('create-submit').textContent = busy ? '正在处理…' : done ? '镜像已准备好' : waiting ? '继续查看进度' : importFlow.needsReconcile ? '核对任务并继续' : importFlow.draft ? '重新导入并完成镜像' : '导入并创建镜像';
+    $('create-open').hidden = !done;
+    $('create-another').hidden = !importFlow.draft;
+    $('create-another').disabled = busy || waiting;
+}
+
+async function loadImportConfig() {
+    if (importConfigPromise) return importConfigPromise;
+    const epoch = authEpoch;
+    const operation = ++importConfigOperation;
+    $('import-config-retry').hidden = true;
+    importConfigPromise = (async () => {
+        try {
+            const fresh = await api('GET', '/import/config');
+            if (epoch !== authEpoch || operation !== importConfigOperation) return;
+            if (!Array.isArray(fresh.allowed_extensions) || !fresh.third_party_data_policy_version) throw new Error('服务暂未提供完整导入说明');
+            if (importConfig && fresh.third_party_data_policy_version !== importConfig.third_party_data_policy_version) $('create-consent').checked = false;
+            importConfig = fresh;
+            $('create-file').accept = fresh.allowed_extensions.join(',');
+            $('import-config-status').textContent = fresh.llm_configured && fresh.embedding_configured
+                ? '当前账号已保存两套模型配置。导入会使用你自己的 Key。'
+                : '请先在“模型设置”中为当前账号保存对话与 Embedding 配置。';
+            $('import-model-settings').hidden = fresh.llm_configured && fresh.embedding_configured;
+            $('import-config-retry').hidden = true;
+            $('import-format-hint').textContent = `支持 ${fresh.allowed_extensions.join(' / ')}，最大 ${Math.floor(fresh.max_upload_bytes / 1024 / 1024)} MB。请保留说话人和正文；HTML、数据库与压缩包需先转换。`;
+            $('import-sample').href = staticUrl('import-example.json');
+        } catch (error) {
+            if (epoch !== authEpoch || operation !== importConfigOperation) return;
+            importConfig = null;
+            $('import-config-status').textContent = `无法读取导入说明：${error.message}`;
+            $('import-config-retry').hidden = false;
+        } finally {
+            if (epoch === authEpoch && operation === importConfigOperation) {
+                importConfigPromise = null;
+                updateImportControls();
+            }
+        }
+    })();
+    return importConfigPromise;
+}
+
+function resetImportForm() {
+    importFlow.reset();
+    for (const id of ['create-name', 'create-target', 'create-basic', 'create-personality', 'create-file']) $(id).value = '';
+    $('create-consent').checked = false;
+    $('create-file-name').textContent = '未选择文件';
+    $('create-result').textContent = '';
+    updateImportControls();
+}
+
+async function resumeImport(mirror) {
+    if (importFlow.busy) { showToast('当前导入正在进行，请先等待结果', 'info'); return; }
+    importFlow.restore(mirror);
+    const epoch = importFlow.epoch;
+    $('create-name').value = mirror.name;
+    $('create-basic').value = ''; $('create-personality').value = '';
+    $('create-target').value = ''; $('create-file').value = '';
+    $('create-file-name').textContent = '未选择文件';
+    $('create-consent').checked = false;
+    $('create-result').textContent = '正在核对已提交的任务…';
+    switchTab('create');
+    // 刷新页面后也优先找到仍在处理的任务，不能重新提交一份。
+    importFlow.busy = true;
+    updateImportControls();
+    try {
+        await importFlow.reconcile(epoch);
+        if (epoch !== importFlow.epoch) return;
+        $('create-result').textContent = importFlow.completed ? '镜像已完成，可以开始对话。' : importFlow.taskId
+            ? '导入仍在处理，点击“继续查看进度”。'
+            : '此镜像尚未完成。重新选择聊天文件并确认说话人后继续；已保存的背景会保留。';
+    } catch (error) {
+        if (epoch !== importFlow.epoch) return;
+        $('create-result').textContent = `无法核对任务：${error.message}。请稍后从镜像列表重试。`;
+    } finally {
+        if (epoch === importFlow.epoch) { importFlow.busy = false; updateImportControls(); }
+    }
+}
+
+$('import-config-retry').addEventListener('click', loadImportConfig);
+$('create-another').addEventListener('click', resetImportForm);
+$('create-open').addEventListener('click', () => {
+    if (importFlow.completed && importFlow.draft) enterChat(importFlow.draft.slug, importFlow.draft.name);
+});
+$('create-submit').addEventListener('click', async () => {
+    if (importFlow.busy) return;
+    const epoch = importFlow.epoch;
+    const resultEl = $('create-result');
+    const input = {
+        name: $('create-name').value, targetName: $('create-target').value,
+        basic: $('create-basic').value, personality: $('create-personality').value,
+        file: $('create-file').files[0], consented: $('create-consent').checked, config: importConfig,
+    };
+    try {
+        const pending = importFlow.submit(input);
+        updateImportControls();
+        const result = await pending;
+        if (epoch !== importFlow.epoch) return;
+        resultEl.textContent = result.recovered ? '镜像已完成，可以开始对话。' : `镜像已准备好：已处理 ${result.messages} 条消息，并根据记录生成人物记忆。可以开始对话，也可以用“ta 不会这样”纠正表达。`;
+        resultEl.style.color = 'var(--chat-green)';
+        $('create-file').value = '';
+        $('create-file-name').textContent = '导入完成';
+        await loadContactList();
+        updateImportControls();
+        $('create-open').focus();
+    } catch (error) {
+        if (epoch !== importFlow.epoch) return;
+        resultEl.textContent = `${error.message}${importFlow.taskId ? '。任务已受理，请继续查看进度。' : importFlow.draft ? '。草稿已保留，请核对文件后重试。' : ''}`;
+        resultEl.style.color = 'var(--red)';
+    } finally {
+        if (epoch === importFlow.epoch) updateImportControls();
+    }
+});
+$('create-file').addEventListener('change', () => {
+    const file = $('create-file').files[0];
+    $('create-file-name').textContent = file ? file.name : '未选择文件';
+    $('create-result').textContent = '';
+});
+
+// ═══════════════════════════════════════
+// 分条回复（FR-062 / FR-063）
+// ═══════════════════════════════════════
+
+// 真实聊天里人是连发多条短消息的：「在吗」「刚看到」「今天好累」。
+// 一整段完整的话反而最不像聊天。服务端把断句位置和每条的延迟一起下发，
+// 这里按节奏逐条冒出来——永远秒回是最出戏的一点。
+async function renderSegments(msgsEl, streamedRow, segments, view = memoryLoop.capture()) {
+    if (!segments || !segments.length) return [streamedRow];
+    streamedRow.remove();
+    const rows = [];
+    for (const seg of segments) {
+        const delayMs = Math.min((seg.delay || 0.5) * 1000, 12000);
+        await new Promise(r => setTimeout(r, delayMs));
+        if (!memoryLoop.isCurrent(view)) return rows;
+        const row = chatBubble('assistant', seg.text);
+        msgsEl.appendChild(row);
+        rows.push(row);
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+    return rows;
+}
+
+// ═══════════════════════════════════════
+// 红包系统
+// ═══════════════════════════════════════
+
+function _wrapAssistantMsg(innerDiv) {
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    if (currentName) {
+        const avatar = document.createElement('div');
+        avatar.className = 'msg-avatar';
+        avatar.style.background = avatarColor(currentSlug);
+        avatar.textContent = (currentName || currentSlug)[0];
+        row.appendChild(avatar);
+    }
+    row.appendChild(innerDiv);
+    return row;
+}
+
+function redPacketBubble(rp) {
+    const div = document.createElement('div');
+    div.className = 'msg redpacket';
+    div.dataset.rpId = rp.id;
+    div.innerHTML = `
+        <div class="rp-bubble">
+            <div class="rp-bubble-icon">🧧</div>
+            <div class="rp-bubble-info">
+                <div class="rp-bubble-note">${escHtml(rp.note)}</div>
+                <div class="rp-bubble-hint">红包</div>
+            </div>
+        </div>
+    `;
+    div.addEventListener('click', () => openRedPacketOverlay(rp));
+    return _wrapAssistantMsg(div);
+}
+
+let currentOpenRpId = null;
+
+function openRedPacketOverlay(rp) {
+    currentOpenRpId = rp.id;
+    $('rp-sender').textContent = currentName || currentSlug;
+    $('rp-note').textContent = rp.note;
+    $('rp-amount').textContent = '¥ ' + rp.amount.toFixed(2);
+    $('rp-done-note').textContent = rp.note;
+
+    // 重置状态
+    $('redpacket-bottom').style.display = 'flex';
+    $('redpacket-result').style.display = 'none';
+    $('rp-open-btn').classList.remove('opened');
+    $('coins-container').innerHTML = '';
+
+    $('redpacket-overlay').style.display = 'flex';
+    $('rp-open-btn').focus();
+}
+
+$('rp-open-btn').addEventListener('click', async function() {
+    const rpId = currentOpenRpId;
+    if (!rpId) return;
+
+    // 旋转按钮动画
+    this.classList.add('opened');
+    this.textContent = '...';
+
+    // 撒金币
+    spawnCoins();
+
+    try {
+        const data = await api('POST', `/exes/${currentSlug}/redpacket/${rpId}/open`);
+        $('rp-amount').textContent = '¥ ' + data.amount.toFixed(2);
+        $('rp-done-note').textContent = data.note;
+
+        // 更新气泡状态
+        const bubble = document.querySelector(`.msg-row .msg.redpacket[data-rp-id="${rpId}"]`);
+        if (bubble) {
+            bubble.querySelector('.rp-bubble-note').textContent = '已领取';
+            bubble.querySelector('.rp-bubble-hint').textContent = '红包已打开';
+            bubble.style.opacity = '0.6';
+        }
+    } catch(e) {
+        $('rp-amount').textContent = '领取失败';
+        $('rp-done-note').textContent = e.message;
+    }
+
+    setTimeout(() => {
+        $('redpacket-bottom').style.display = 'none';
+        $('redpacket-result').style.display = 'block';
+    }, 800);
+});
+
+$('rp-close-btn').addEventListener('click', closeRedPacketOverlay);
+
+function closeRedPacketOverlay() {
+    $('redpacket-overlay').style.display = 'none';
+    if (currentSlug) loadWallet();
+    $('msg-input').focus();
+}
+
+// Escape 键关闭红包弹窗
+document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && $('redpacket-overlay').style.display !== 'none') {
+        closeRedPacketOverlay();
+    }
+});
+
+function spawnCoins() {
+    const container = $('coins-container');
+    const emojis = ['🪙', '✨', '💛', '⭐', '💰'];
+    for (let i = 0; i < 18; i++) {
+        const coin = document.createElement('span');
+        coin.className = 'coin';
+        coin.textContent = emojis[i % emojis.length];
+        coin.style.setProperty('--dx', (Math.random() * 200 - 100) + 'px');
+        coin.style.setProperty('--dy', (Math.random() * -160 - 40) + 'px');
+        coin.style.animationDelay = (Math.random() * 0.3) + 's';
+        coin.style.animationDuration = (1 + Math.random() * 0.6) + 's';
+        container.appendChild(coin);
+    }
+    setTimeout(() => { container.innerHTML = ''; }, 1500);
+}
+
+// ═══════════════════════════════════════
+// 转账系统
+// ═══════════════════════════════════════
+
+function transferBubble(tx) {
+    const div = document.createElement('div');
+    div.className = 'msg transfer';
+    div.dataset.txId = tx.id;
+    const isIncoming = tx.direction === 'ta_to_me';
+    div.innerHTML = `
+        <div class="tx-bubble">
+            <div class="tx-bubble-icon">💸</div>
+            <div class="tx-bubble-info">
+                <div class="tx-bubble-note">${escHtml(tx.note || '转账')}</div>
+                <div class="tx-bubble-status">${isIncoming ? '转账给你' : '向你转账'} · 待收款</div>
+                <div class="tx-bubble-amount">¥ ${tx.amount.toFixed(2)}</div>
+            </div>
+        </div>
+    `;
+    div.addEventListener('click', async () => {
+        if (!confirm(`确认收款 ¥${tx.amount.toFixed(2)}？`)) return;
+        try {
+            await api('POST', `/exes/${currentSlug}/transfer/${tx.id}/confirm`, {action:'receive'});
+            div.querySelector('.tx-bubble-status').textContent = '已收款';
+            div.style.opacity = '0.6';
+            loadWallet();
+        } catch(e) { showToast('收款失败: ' + e.message, 'error'); }
+    });
+    return _wrapAssistantMsg(div);
+}
+
+// ═══════════════════════════════════════
+// 钱包页
+// ═══════════════════════════════════════
+
+async function loadWallet() {
+    if (!currentSlug) return;
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/wallet`);
+        $('wallet-balance').textContent = '¥ ' + data.balance.toFixed(2);
+
+        const txList = $('wallet-tx-list');
+        const txs = data.transactions || [];
+        if (!txs.length) {
+            txList.innerHTML = '<p class="list-empty">暂无交易记录</p>';
+        } else {
+            txList.innerHTML = txs.slice().reverse().map(tx => {
+                const isIncome = tx.type.includes('received');
+                return `
+                    <div class="wallet-tx-item">
+                        <div class="wallet-tx-icon ${isIncome ? 'income' : 'outgo'}">
+                            ${isIncome ? '↓' : '↑'}
+                        </div>
+                        <div class="wallet-tx-info">
+                            <div class="wallet-tx-name">${txTypeLabel(tx.type)}</div>
+                            <div class="wallet-tx-time">${(tx.time || '').slice(0,16)}</div>
+                        </div>
+                        <div class="wallet-tx-amount ${isIncome ? 'income' : 'outgo'}">
+                            ${isIncome ? '+' : '-'}¥ ${tx.amount.toFixed(2)}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+    } catch(e) {
+        $('wallet-tx-list').innerHTML = '<p class="list-empty">加载失败</p>';
+    }
+}
+
+function txTypeLabel(type) {
+    const map = {
+        'red_packet_received': '收到红包',
+        'red_packet_sent': '发出红包',
+        'transfer_received': '收到转账',
+        'transfer_sent': '转出',
+    };
+    return map[type] || type;
+}
+
+$('wallet-redpacket-btn').addEventListener('click', async () => {
+    if (!currentSlug) return;
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/wallet`);
+        const txs = (data.transactions || []).filter(t => t.type.includes('red_packet'));
+        renderFilteredTx(txs);
+    } catch(e) {}
+});
+
+$('wallet-transfer-btn').addEventListener('click', async () => {
+    if (!currentSlug) return;
+    try {
+        const data = await api('GET', `/exes/${currentSlug}/wallet`);
+        const txs = (data.transactions || []).filter(t => t.type.includes('transfer'));
+        renderFilteredTx(txs);
+    } catch(e) {}
+});
+
+function renderFilteredTx(txs) {
+    const txList = $('wallet-tx-list');
+    if (!txs.length) {
+        txList.innerHTML = '<p class="list-empty">暂无相关记录</p>';
+        return;
+    }
+    txList.innerHTML = txs.slice().reverse().map(tx => {
+        const isIncome = tx.type.includes('received');
+        return `
+            <div class="wallet-tx-item">
+                <div class="wallet-tx-icon ${isIncome ? 'income' : 'outgo'}">${isIncome ? '↓' : '↑'}</div>
+                <div class="wallet-tx-info">
+                    <div class="wallet-tx-name">${txTypeLabel(tx.type)}</div>
+                    <div class="wallet-tx-time">${(tx.time || '').slice(0,16)}</div>
+                </div>
+                <div class="wallet-tx-amount ${isIncome ? 'income' : 'outgo'}">
+                    ${isIncome ? '+' : '-'}¥ ${tx.amount.toFixed(2)}
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+// ═══════════════════════════════════════
+// 工具
+// ═══════════════════════════════════════
+
+function escHtml(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ═══════════════════════════════════════
+// 语音消息
+// ═══════════════════════════════════════
+
+let isVoiceMode = false;
+
+function initVoiceToggle() {
+    // 检查浏览器是否支持 Web Speech API
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+        try {
+            speechRecognition = new SpeechRecognition();
+            speechRecognition.lang = 'zh-CN';
+            speechRecognition.interimResults = false;
+            speechRecognition.maxAlternatives = 1;
+        } catch(e) { /* 浏览器不支持语音识别 */ }
+    }
+
+    const voiceBtn = $('voice-toggle-btn');
+    if (!voiceBtn) return;
+    voiceBtn.addEventListener('click', () => {
+        isVoiceMode = !isVoiceMode;
+        if (isVoiceMode) {
+            $('voice-toggle-btn').textContent = '⌨';
+            $('msg-input').style.display = 'none';
+            $('voice-record-btn').style.display = 'flex';
+        } else {
+            $('voice-toggle-btn').textContent = '🎤';
+            $('msg-input').style.display = '';
+            $('voice-record-btn').style.display = 'none';
+        }
+    });
+
+    const recordBtn = $('voice-record-btn');
+    let recordTimer, recordDuration, voiceRecording = false;
+    let mediaRecorder = null;
+    let audioChunks = [];
+
+    recordBtn.addEventListener('touchstart', startVoiceRecord, {passive: false});
+    recordBtn.addEventListener('mousedown', e => {
+        if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return;
+        startVoiceRecord(e);
+    });
+    recordBtn.addEventListener('touchend', stopVoiceRecord);
+    recordBtn.addEventListener('mouseup', stopVoiceRecord);
+    recordBtn.addEventListener('mouseleave', stopVoiceRecord);
+
+    async function startVoiceRecord(e) {
+        if (!isVoiceMode || voiceRecording) return;
+        e.preventDefault();
+        voiceRecording = true;
+        audioChunks = [];
+        recordBtn.classList.add('recording');
+        recordBtn.innerHTML = '<span class="voice-recording-dot"></span> 松开 发送';
+        recordDuration = 0;
+        recordTimer = setInterval(() => { recordDuration++; updateRecordTimer(); }, 1000);
+
+        // 启动 MediaRecorder 录制真实音频
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+            mediaRecorder = new MediaRecorder(stream, {mimeType: 'audio/webm;codecs=opus'});
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) audioChunks.push(e.data);
+            };
+            mediaRecorder.start();
+        } catch(err) {
+            console.warn('MediaRecorder not available:', err);
+        }
+
+        // 启动语音识别
+        if (speechRecognition) {
+            try { speechRecognition.start(); } catch(e) {}
+        }
+    }
+
+    function updateRecordTimer() {
+        const min = Math.floor(recordDuration / 60);
+        const sec = recordDuration % 60;
+        const timeStr = `${min}:${sec.toString().padStart(2, '0')}`;
+        recordBtn.innerHTML = `<span class="voice-recording-dot"></span> ${timeStr} 松开 发送`;
+    }
+
+    function stopVoiceRecord(e) {
+        if (!voiceRecording) return;
+        e.preventDefault();
+        voiceRecording = false;
+        recordBtn.classList.remove('recording');
+        recordBtn.innerHTML = '<span class="voice-recording-dot"></span> 按住 说话';
+        clearInterval(recordTimer);
+
+        // 停止 MediaRecorder
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
+            mediaRecorder.stream.getTracks().forEach(t => t.stop());
+        }
+
+        // 停止语音识别
+        if (speechRecognition) {
+            try { speechRecognition.stop(); } catch(e) {}
+        }
+
+        if (recordDuration > 0 && currentSlug) {
+            const dur = Math.min(recordDuration, 60);
+            const msgsEl = $('chat-msgs');
+            msgsEl.appendChild(voiceBubble('user', dur));
+            msgsEl.scrollTop = msgsEl.scrollHeight;
+            // 等待语音识别结果，超时 800ms 后发送
+            const waitAndSend = () => {
+                const sttText = speechRecognition?._lastResult || '';
+                sendVoiceMessage(dur, sttText);
+                if (speechRecognition) speechRecognition._lastResult = '';
+            };
+            if (speechRecognition && speechRecognition._lastResult) {
+                waitAndSend();
+            } else {
+                setTimeout(waitAndSend, 800);
+            }
+        }
+    }
+
+    // 缓存语音识别结果
+    if (speechRecognition) {
+        speechRecognition.onresult = (event) => {
+            const result = event.results[event.results.length - 1];
+            if (result.isFinal) {
+                speechRecognition._lastResult = result[0].transcript;
+            }
+        };
+        speechRecognition.onerror = () => {};
+    }
+
+    // ── 加号按钮：展开更多功能 ──
+    const plusBtn = $('plus-btn');
+    const plusPanel = $('plus-panel');
+    if (plusBtn && plusPanel) {
+        plusBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const visible = plusPanel.style.display !== 'none';
+            plusPanel.style.display = visible ? 'none' : 'flex';
+        });
+        document.addEventListener('click', () => {
+            plusPanel.style.display = 'none';
+        });
+    }
+
+    // ── 图片上传 ──
+    const imageInput = $('image-file-input');
+    if (imageInput) {
+        imageInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file || !currentSlug || !memoryLoop.ready) return;
+            const view = memoryLoop.capture();
+            const msgsEl = $('chat-msgs');
+            if (!msgsEl) return;
+
+            // 显示图片预览
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+                if (!memoryLoop.isCurrent(view)) return;
+                const row = document.createElement('div');
+                row.className = 'msg-row user';
+                row.dataset.timestamp = Date.now();
+                row.innerHTML = `<div class="msg user image-msg"><img src="${ev.target.result}" class="msg-image" alt="图片" loading="lazy"></div>`;
+                msgsEl.appendChild(row);
+                msgsEl.scrollTop = msgsEl.scrollHeight;
+
+                // 添加已读标记
+                const readStatus = document.createElement('div');
+                readStatus.className = 'msg-read-status';
+                readStatus.textContent = '已发送';
+                row.appendChild(readStatus);
+
+                // 发送图片消息
+                try {
+                    const formData = new FormData();
+                    formData.append('file', file);
+                    const resp = await fetch(`${API}/chat`, {
+                        method: 'POST',
+                        headers: authHeaders(),
+                        body: JSON.stringify({slug: view.slug, message: '[图片]', conversation_id: view.conversationId}),
+                    });
+                    if (!memoryLoop.isCurrent(view)) return;
+                    if (resp.status === 401) { logout(); return; }
+                    if (!resp.ok) throw new Error('图片消息发送失败');
+                    readStatus.textContent = '已读';
+                    readStatus.classList.add('read');
+                } catch(err) {
+                    readStatus.textContent = '发送失败';
+                }
+            };
+            reader.readAsDataURL(file);
+            imageInput.value = '';
+        });
+    }
+}
+
+function voiceBubble(role, duration) {
+    const row = document.createElement('div');
+    row.className = 'msg-row ' + role;
+    const div = document.createElement('div');
+    div.className = 'msg voice';
+    div.innerHTML = `
+        <span class="voice-icon">🔊</span>
+        <span class="voice-wave">${'<span class="bar"></span>'.repeat(7)}</span>
+        <span class="voice-dur">${duration}″</span>
+    `;
+    div.addEventListener('click', () => {
+        div.classList.toggle('playing');
+        div.classList.toggle('paused');
+    });
+    row.appendChild(div);
+    return row;
+}
+
+async function sendVoiceMessage(duration, sttText) {
+    if (!currentSlug || !memoryLoop.ready) return;
+    const view = memoryLoop.capture();
+    const controller = new AbortController();
+    memoryLoop.track(controller);
+    const msgsEl = $('chat-msgs');
+    if ($('chat-empty-hint').style.display !== 'none') {
+        $('chat-empty-hint').style.display = 'none';
+        msgsEl.style.display = 'flex';
+    }
+    const typingRow = typingIndicator();
+    msgsEl.appendChild(typingRow);
+    const message = sttText ? sttText : `[语音消息 ${duration}秒]`;
+    try {
+        const res = await fetch(`${API}/chat/stream`, {
+            method: 'POST', headers: authHeaders(),
+            body: JSON.stringify({slug: view.slug, message, conversation_id: view.conversationId}),
+            signal: controller.signal,
+        });
+        if (!memoryLoop.isCurrent(view)) { await res.body?.cancel?.(); return; }
+        typingRow.remove();
+        await parseChatStream(res, msgsEl, view);
+    } catch (error) {
+        if (!memoryLoop.isCurrent(view)) return;
+        typingRow.remove();
+        msgsEl.appendChild(sysMsg(error.message || '语音消息发送失败'));
+    } finally {
+        memoryLoop.untrack(controller);
+        if (memoryLoop.isCurrent(view)) msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+}
+
+// ═══════════════════════════════════════
+// 消息时间戳
+// ═══════════════════════════════════════
+
+const CHAT_TIME_GAP = 5 * 60 * 1000;
+let lastMsgTime = 0;
+
+function maybeAddTimestamp(msgsEl) {
+    const now = Date.now();
+    if (now - lastMsgTime > CHAT_TIME_GAP) {
+        const timeDiv = document.createElement('div');
+        timeDiv.className = 'msg-time';
+        timeDiv.textContent = formatTime(now);
+        msgsEl.appendChild(timeDiv);
+    }
+    lastMsgTime = now;
+}
+
+function formatTime(ts) {
+    const d = new Date(ts);
+    const now = new Date();
+    const h = d.getHours().toString().padStart(2,'0');
+    const m = d.getMinutes().toString().padStart(2,'0');
+    const isToday = d.toDateString() === now.toDateString();
+    if (isToday) return h + ':' + m;
+
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const isYesterday = d.toDateString() === yesterday.toDateString();
+    if (isYesterday) return '昨天 ' + h + ':' + m;
+
+    const M = (d.getMonth()+1).toString().padStart(2,'0');
+    const D = d.getDate().toString().padStart(2,'0');
+    const Y = d.getFullYear();
+    if (Y === now.getFullYear()) return M + '-' + D + ' ' + h + ':' + m;
+    return Y + '-' + M + '-' + D + ' ' + h + ':' + m;
+}
+
+// ═══════════════════════════════════════
+// 全局点击：关闭表情面板
+// ═══════════════════════════════════════
+
+$('chat-msgs').addEventListener('click', () => {
+    const panel = $('sticker-panel');
+    if (panel.style.display !== 'none') {
+        panel.style.display = 'none';
+        $('chat-msgs').classList.remove('has-panel');
+        $('sticker-toggle-btn').textContent = '😊';
+    }
+});
+
+// ── 初始化 ──
+initTheme();
+if (PROXY_AUTH || token) {
+    showMain();
+} else { showAuth(); }
+updateStatusTime();
+setInterval(updateStatusTime, 30000);
+initDesktopLayout();
+initDesktopSidebar();
+try { initVoiceToggle(); } catch(e) { console.warn('Voice init skipped:', e.message); }
+initSearch();
+registerSW();
+requestNotificationPermission();
+initMobileGestures();
+window.parent.postMessage({type: 'ex-memory:ready'}, window.location.origin);

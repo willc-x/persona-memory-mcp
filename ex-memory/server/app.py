@@ -1,0 +1,184 @@
+"""FastAPI 应用入口。"""
+
+import hmac
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+
+from server.middleware import setup_cors, RateLimiter, RequestLoggingMiddleware
+from server.routes import router
+from server.model_settings_routes import router as model_settings_router
+
+STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
+
+
+def create_app() -> FastAPI:
+    import config
+
+    if config.METEOR_STORE_SSO_ENABLED and not config.METEOR_STORE_PROXY_TOKEN:
+        raise RuntimeError("METEOR_STORE_PROXY_TOKEN is required in proxy SSO mode")
+
+    from server.auth import init_db
+
+    init_db()
+
+    # 危机文案未经专业审阅时不阻止启动，但必须让运维看见
+    from core import kv, observability
+
+    observability.init_metrics()
+    observability.init_tracing(otlp_endpoint=config.OTLP_ENDPOINT)
+
+    kv.configure(config.REDIS_URL)
+    # 失效处理器在 server.routes 导入时注册（每进程一次），这里只起订阅线程
+    kv.start_invalidation_listener()
+
+    # 导入即注册任务处理器
+    import server.task_handlers  # noqa: F401
+    from core.tasks import reclaim_stale
+
+    reclaim_stale()
+
+    from core.safety.resources import warn_if_unreviewed
+
+    warn_if_unreviewed()
+
+    # 实名开启但未接短信服务商时装上开发用实现并告警。
+    # 不静默关闭实名——合规底线不能靠默认值失守。
+    if config.REQUIRE_PHONE_VERIFICATION:
+        from core.safety import sms
+
+        if sms.get_provider() is None:
+            sms.set_provider(sms.ConsoleProvider())
+            logger_ = __import__("logging").getLogger("ex-memory")
+            logger_.warning(
+                "已开启手机号实名但未配置短信服务商，当前使用开发用 ConsoleProvider"
+                "（验证码只打日志，不真发短信）。生产环境必须注入真实实现。"
+            )
+
+    app = FastAPI(
+        title="ex-memory API",
+        description="前任记忆智能体 REST API",
+        version="1.0.0",
+        docs_url="/api/docs",
+        redoc_url="/api/redoc",
+    )
+
+    setup_cors(app)
+
+    # 请求日志中间件（在限流之前记录）
+    app.middleware("http")(RequestLoggingMiddleware())
+
+    # 限流中间件
+    app.middleware("http")(RateLimiter(max_requests=120, window_seconds=60))
+
+    app.include_router(router)
+    app.include_router(model_settings_router)
+
+    # 静态文件
+    if STATIC_DIR.exists():
+        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.get("/")
+    def index():
+        """Web 客户端首页。"""
+        html = STATIC_DIR / "index.html"
+        if html.exists():
+            import config
+
+            document = html.read_text(encoding="utf-8")
+            auth_mode = "proxy" if config.METEOR_STORE_SSO_ENABLED else "native"
+            document = document.replace(
+                '<html lang="zh-CN">',
+                f'<html lang="zh-CN" data-base-path="{config.PUBLIC_BASE_PATH}" '
+                f'data-auth-mode="{auth_mode}">',
+                1,
+            )
+            if config.METEOR_STORE_SSO_ENABLED:
+                document = document.replace(
+                    '<div id="offline-banner" class="offline-banner" role="alert">'
+                    '\n    <span class="offline-status-dot" aria-hidden="true"></span>'
+                    '\n    <span class="offline-status-copy"><strong>连接已中断</strong>'
+                    "<small>请检查网络后重试</small></span>"
+                    '\n    <button id="offline-retry" class="offline-retry" type="button">重试</button>'
+                    "\n</div>",
+                    "",
+                    1,
+                )
+            return HTMLResponse(document, headers={"Cache-Control": "no-store"})
+        return {"message": "ex-memory API", "docs": "/api/docs"}
+
+    @app.get("/metrics")
+    def metrics(request: Request):
+        """Prometheus 抓取端点。
+
+        未配置 METRICS_TOKEN 时返回 404 而非空指标：指标暴露的是运营
+        信息（用量、错误率、供应商），默认公开是不可接受的。
+        """
+        if not config.METRICS_TOKEN:
+            raise HTTPException(status_code=404, detail="Not found")
+        provided = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if not hmac.compare_digest(provided, config.METRICS_TOKEN):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+        from core import kv
+
+        gauge = observability.metric("kv_degraded")
+        if gauge is not None:
+            gauge.set(1 if kv.is_degraded() else 0)
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "version": "1.0.0"}
+
+    @app.get("/health/ready")
+    def health_ready():
+        """就绪检查：验证依赖是否可用。"""
+        import shutil
+
+        checks = {}
+
+        # ChromaDB 可写检查
+        try:
+            from config import PROJECT_DIR
+
+            test_dir = PROJECT_DIR / "data" / "health_check_chroma"
+            test_dir.mkdir(parents=True, exist_ok=True)
+            (test_dir / ".write_test").write_text("ok")
+            checks["chromadb"] = "ok"
+        except Exception as e:
+            checks["chromadb"] = f"error: {e}"
+
+        # 磁盘空间检查 (>100MB)
+        try:
+            usage = shutil.disk_usage(str(PROJECT_DIR))
+            free_mb = usage.free // (1024 * 1024)
+            checks["disk"] = "ok" if free_mb > 100 else f"low: {free_mb}MB free"
+        except Exception:
+            checks["disk"] = "unknown"
+
+        all_ok = all(v == "ok" or v.startswith("low:") for v in checks.values())
+        return {
+            "status": "ok" if all_ok else "degraded",
+            "version": "1.0.0",
+            "checks": checks,
+        }
+
+    return app
+
+
+app = create_app()
+
+
+def run_server(host: str = "0.0.0.0", port: int = 8000):
+    import uvicorn
+
+    uvicorn.run("server.app:app", host=host, port=port, reload=True)
+
+
+if __name__ == "__main__":
+    run_server()
