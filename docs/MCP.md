@@ -224,6 +224,7 @@ owner/slug 是**服务侧配置**，客户端参数里没有这两个字段，�
 | `message` | 是 | 1–5000 字符 |
 | `conversation_id` | 否 | 匹配 `^[A-Za-z0-9_-]{1,80}$`；用于延续独立会话 |
 | `period` | 否 | 同 `memory_search` |
+| `relationship_mode` | 否 | `evidence`（默认）或 `fiction`；同一 conversation_id 不可混用 |
 
 返回：
 
@@ -234,6 +235,7 @@ owner/slug 是**服务侧配置**，客户端参数里没有这两个字段，�
   "period": "latest",
   "selected_period": "…",
   "supported_period": true,
+  "relationship_mode": "evidence",
   "sources": [],
   "memory": {"turn_id": "…", "conversation_id": "…", "indexed": true},
   "usage": {"prompt_tokens": 0, "completion_tokens": 0},
@@ -250,6 +252,8 @@ owner/slug 是**服务侧配置**，客户端参数里没有这两个字段，�
 5. 独立会话、向量索引和真实历史库分开存储；用户可见回复不加模拟/AI 前缀，内部来源标记保留审计语义。
 
 `conversation_id` 可以自行生成，也可由客户端保存返回的值；不要使用包含个人信息或秘密的 id。伪造 `conversation_id` 不会越过 owner/slug 隔离。
+
+`relationship_mode=fiction` 只表示“当前对话允许用户选择的虚构亲密关系”，不是历史事实开关：历史事件、日期、人物、旧承诺仍只能来自证据；被追问时回复应说明这是当前对话，不是旧记录。模式只影响独立 AI 会话，不能写入真实历史。
 
 ---
 

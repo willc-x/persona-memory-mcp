@@ -177,6 +177,71 @@ class RealHistory:
         return {'record_types': by_kind, 'senders': by_sender, 'sources': sources}
 
 
+    def keyword_results(self, query, limit=4, source_tag='chat'):
+        """对明确的过去提问做本地词面补召回；只返回逐字存在、可回查的行。
+
+        向量检索对短问句不稳定，可能把“中午吃啥”排到“喜欢吃炸鸡柳”之前。
+        这里不生成任何内容，只在原始 SQLite 中按查询的 2-4 字片段做覆盖度排序，
+        作为向量结果的补充；最终仍由运行层做 cutoff/来源校验。
+        """
+        if not isinstance(query, str) or not query.strip():
+            return []
+        # 去掉“你记得/咱俩/以前/什么吗”这类问句外壳，只保留内容焦点。
+        stop = set('你我他她咱俩们的吗呢啊吧呀了呢记得以前之后上次那这时候什么说')
+        focus = ''.join(char for char in query if char not in stop).strip()
+        if len(focus) < 2:
+            return []
+        grams = set()
+        for size in (2, 3, 4):
+            for index in range(0, max(0, len(focus) - size + 1)):
+                gram = focus[index:index + size]
+                if gram.strip():
+                    grams.add(gram)
+        if not grams:
+            return []
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT message_id,source_id,source_line,timestamp,sender,role,content,raw_json "
+                "FROM records WHERE record_type='message' AND role IN ('A','B') "
+                "AND content IS NOT NULL AND content<>''").fetchall()
+        scored = []
+        for row in rows:
+            content = row['content'] or ''
+            if not any(len(gram) >= 3 and gram in content for gram in grams):
+                continue
+            score = sum(len(gram) for gram in grams if gram in content)
+            if score >= 6:
+                scored.append((score, len(content), row))
+        scored.sort(key=lambda item: (-item[0], -min(item[1], 40), item[2]['source_line']))
+        results = []
+        for _score, _size, row in scored[:max(0, limit)]:
+            content = row['content'] or ''
+            stamp = row['timestamp']
+            if not stamp:
+                continue
+            raw = json.loads(row['raw_json'] or '{}')
+            evidence = {
+                'sender': row['role'], 'raw_sender': row['sender'],
+                'source_line': row['source_line'], 'quote': content,
+                'timestamp': stamp, 'time': stamp,
+                'source_file': raw.get('source_file', ''),
+                'source_id': row['source_id'], 'message_id': row['message_id'],
+                'origin': 'real_chat',
+            }
+            results.append({
+                'id': f"lexical:{row['source_id']}:{row['message_id']}",
+                'document': content,
+                'metadata': {
+                    'source': source_tag, 'sender': row['role'], 'source_line': row['source_line'],
+                    'start_ts': stamp, 'end_ts': stamp, 'source_id': row['source_id'],
+                    'message_id': row['message_id'], 'source_file': raw.get('source_file', ''),
+                    'raw_sender': row['sender'], 'evidence_flattened': True, 'evidence': [evidence],
+                },
+                'distance': 0.0,
+                'score': 1.0,
+            })
+        return results
+
 class HistoricalVectorStore(VectorStore):
     """复用上游 ingest/search；真实历史禁止混入 AI 摘要，引用回查独立原始账本。"""
     def __init__(self, persist_dir, collection_name, *, slug, owner, history=None, cutoff=None):

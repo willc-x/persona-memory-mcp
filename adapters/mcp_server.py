@@ -17,6 +17,8 @@ import threading
 from collections import Counter
 from typing import Any, Callable, Optional
 
+from adapters.session_memory import validate_relationship_mode
+
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "ex-memory-local-grounded"
 SERVER_VERSION = "0.1.0"
@@ -81,6 +83,7 @@ def _period(value: Any) -> tuple[Optional[str], str]:
 def _visible_reply(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise MCPError("generation_failed", "模型未返回有效文本；未保存本轮记忆")
+    # 用户可见正文不添加任何标识；模型偶发返回的旧标记也从正文清除。
     reply = re.sub(r"^\s*(?:【(?:AI)?(?:模拟回复|生成|模拟|分身)】\s*)+", "", value).strip()
     if not reply:
         raise MCPError("generation_failed", "模型未返回可展示正文；未保存本轮记忆")
@@ -181,6 +184,10 @@ def _tool_definitions() -> list[dict]:
                     "message": {"type": "string", "minLength": 1, "maxLength": 5000},
                     "conversation_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,80}$"},
                     "period": period,
+                    "relationship_mode": {
+                        "type": "string", "enum": ["evidence", "fiction"], "default": "evidence",
+                        "description": "evidence=严格历史事实；fiction=用户明确选择的当前虚构亲密对话，仍不编造历史",
+                    },
                 },
                 "required": ["message"], "additionalProperties": False,
             },
@@ -306,9 +313,13 @@ class MCPServer:
         if os.environ.get("DSH_MCP_CHAT_AUTH") != "true":
             raise MCPError("chat_not_authorized",
                            "需要显式设置 DSH_MCP_CHAT_AUTH=true；未调用模型、未检索正文、未写入会话记忆")
-        args = self._arguments(arguments, {"message", "conversation_id", "period"}, {"message"})
+        args = self._arguments(arguments, {"message", "conversation_id", "period", "relationship_mode"}, {"message"})
         message = _text(args.get("message"), "message")
         era, requested = _period(args.get("period"))
+        try:
+            relationship_mode = validate_relationship_mode(args.get("relationship_mode", "evidence"))
+        except ValueError:
+            raise MCPError("invalid_arguments", "relationship_mode 只能是 evidence 或 fiction") from None
         conversation_id = args.get("conversation_id")
         if conversation_id is not None and (
             not isinstance(conversation_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,80}", conversation_id) is None):
@@ -317,7 +328,8 @@ class MCPServer:
         try:
             # 唯一的模型调用入口是该方法内部的 privacy.get_allowed_client(purpose='chat')。
             engine = state.engine(era)
-            conversation_id = state.sessions.ensure_conversation(conversation_id, era)
+            engine.relationship_mode = relationship_mode
+            conversation_id = state.sessions.ensure_conversation(conversation_id, era, relationship_mode)
         except (ValueError, TypeError):
             raise MCPError("invalid_period_or_conversation", "period/conversation_id 无效或与既有会话不一致") from None
         except FileNotFoundError:
@@ -326,9 +338,27 @@ class MCPServer:
             raise MCPError("busy", "已有两个模拟请求运行，请稍后再试")
         try:
             with state.conversation_lock(conversation_id):
-                history = state.sessions.history(conversation_id, era)
+                duplicate = state.sessions.duplicate_turn(
+                    conversation_id, message, relationship_mode=relationship_mode, within_seconds=45)
+                if duplicate is not None:
+                    return {
+                        "reply": duplicate["reply"],
+                        "conversation_id": conversation_id,
+                        "relationship_mode": relationship_mode,
+                        "period": requested,
+                        "selected_period": getattr(engine, "selected_era", {}).get("id") if isinstance(getattr(engine, "selected_era", None), dict) else None,
+                        "supported_period": bool(getattr(engine, "supported_era", False)),
+                        "sources": duplicate["sources"],
+                        "memory": {"turn_id": duplicate["turn_id"], "conversation_id": conversation_id,
+                                   "indexed": duplicate["indexed"]},
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                        "persona_status": _safe_artifact_status(getattr(engine, "artifact_status", "unknown")),
+                        "deduplicated": True,
+                    }
+            with state.conversation_lock(conversation_id):
+                history = state.sessions.history(conversation_id, era, relationship_mode=relationship_mode)
                 # 每轮独立 engine 实例持有 session_memories，避免跨请求污染与 cutoff race。
-                engine.session_memories = state.sessions.search(message, era=era)
+                engine.session_memories = state.sessions.search(message, era=era, relationship_mode=relationship_mode)
                 try:
                     from adapters.privacy import PrivacyError
                     reply, _stickers, usage, sources = engine.chat_with_sources(message, history, conversation_id)
@@ -341,11 +371,13 @@ class MCPServer:
                 verified = state.verifier.enrich_sources(sources)
                 public_sources = _public_sources(verified, MAX_SOURCES)
                 # 只把脱敏后的 canonical 引用存入独立对话库，不写真实历史 collection。
-                saved = state.sessions.append_turn(conversation_id, message, reply, public_sources, era, ai_generated=True)
+                saved = state.sessions.append_turn(conversation_id, message, reply, public_sources, era, ai_generated=True,
+                                                     relationship_mode=relationship_mode)
             selected = getattr(engine, "selected_era", None)
             return {
                 "reply": reply,
                 "conversation_id": conversation_id,
+                "relationship_mode": relationship_mode,
                 "period": requested,
                 "selected_period": selected.get("id") if isinstance(selected, dict) else None,
                 "supported_period": bool(getattr(engine, "supported_era", False)),
@@ -405,7 +437,16 @@ class MCPServer:
             elif method == "tools/call":
                 name = params.get("name")
                 arguments = params.get("arguments", {})
-                if not isinstance(name, str) or set(params) - {"name", "arguments"}:
+                # 部分客户端会在 tools/call 中加入 MCP 允许的 _meta；只忽略它，
+                # 其他未知字段仍拒绝，且日志只记录键名/类型，不记录参数正文。
+                if (not isinstance(name, str)
+                        or set(params) - {"name", "arguments", "_meta"}):
+                    self._log(
+                        "rpc.tools_call.invalid keys="
+                        + ",".join(sorted(str(k) for k in params))
+                        + f" name_type={type(name).__name__}"
+                        + f" arguments_type={type(arguments).__name__}"
+                    )
                     return {"jsonrpc": "2.0", "id": request_id,
                             "error": {"code": -32602, "message": "Invalid tools/call params"}}
                 # 工具名不受信任；只使用预定义事件，避免日志注入或回显正文/路径。
@@ -417,10 +458,10 @@ class MCPServer:
                 except MCPError as exc:
                     result = self._tool_result({"error": exc.code, "message": exc.message}, error=True)
                     self._log(f"tool.{event_name}.rejected")
-                except Exception:
-                    # 底层异常可能含正文/路径，不进入响应或日志。
+                except Exception as exc:
+                    # 底层异常可能含正文/路径，仅记录异常类型，不进入响应或日志。
                     result = self._tool_result({"error": "internal_error", "message": "本地操作失败；请检查服务配置"}, error=True)
-                    self._log(f"tool.{event_name}.failed")
+                    self._log(f"tool.{event_name}.failed type={type(exc).__name__}")
             else:
                 return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}}
             return {"jsonrpc": "2.0", "id": request_id, "result": result}

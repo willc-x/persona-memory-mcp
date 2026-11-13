@@ -394,3 +394,18 @@ def test_concurrent_chats_have_independent_engines_and_periods(server, harness, 
     assert len(harness.engines) == 2
     assert {engine.kwargs["era"] for engine in harness.engines} == {"2021-01", "2021-02"}
     assert all(id(engine) != id(harness.engines[0]) for engine in harness.engines[1:])
+
+
+def test_repeated_same_turn_is_idempotent_and_does_not_call_model_twice(server, harness, monkeypatch):
+    monkeypatch.setenv("DSH_MCP_CHAT_AUTH", "true")
+    args = {"message": "合成重复请求", "conversation_id": "retry-test", "period": "2021-01"}
+    first = structured(tool(server, "simulate_persona", args))
+    before = sum(engine.chat_calls for engine in harness.engines)
+    second = structured(tool(server, "simulate_persona", args))
+    assert sum(engine.chat_calls for engine in harness.engines) == before == 1
+    assert second["deduplicated"] is True
+    assert second["reply"] == first["reply"]
+    assert second["memory"]["turn_id"] == first["memory"]["turn_id"]
+    with harness.states[0].sessions.connect() as db:
+        count = db.execute("SELECT count(*) FROM turns WHERE conversation_id='retry-test'").fetchone()[0]
+    assert count == 1

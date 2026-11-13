@@ -380,6 +380,8 @@ export CHAT_MCP_SLUG=persona
 - stdout 只输出 JSON-RPC，运行状态走 stderr；
 - `memory_search`、`persona_status`、`list_periods` 只读本地状态，不调用 LLM；
 - `simulate_persona` 需要 `DSH_MCP_CHAT_AUTH=true` **且**已有 `chat` 授权，回复正文不带可见模拟/AI 标签，会话与真实历史分开存储，内部标为 AI 模拟；
+- `simulate_persona` 的 `relationship_mode` 默认 `evidence`；显式传 `fiction` 时，当前对话可延续用户选择的虚构亲密设定，但历史事实仍必须有证据，且两种模式不能在同一 conversation_id 混用；
+- 当前轮“今天/刚才”只读独立 AI 会话，明确的历史提问才查 Chroma；短问句会叠加原始账本逐字补召回，引用时按 A/B 原说话人归属；
 - 工具不返回原始文件路径、完整 prompt、密钥或任意写接口；
 - owner/slug 必须与安装/导入时一致，且由环境变量配置，不写死在代码里；
 - 默认 `CHAT_MCP_SLUG=persona`，owner 默认 `1`；生产环境应显式设置，不要依赖默认值。

@@ -118,3 +118,33 @@ def test_private_http_auth_and_ai_isolation(tmp_path):
         history = client.get('/chat/api/synthetic/conversations/' + result['conversation_id'] + '?era=2021-01', headers=headers).json()['history']
         assert history[-1]['content'] == synthetic_reply
         assert client.post('/chat/api/synthetic/search', headers=headers, json={'query': 'x', 'era': '2021-01'}).json()['llm_calls'] == 0
+
+
+def test_relationship_mode_persists_and_isolates_vectors(tmp_path):
+    memory = SessionMemory(tmp_path, owner=9, slug='synthetic', embedder=StubEmbedder())
+    evidence = memory.ensure_conversation('evidence-chat', '2021-01')
+    fiction = memory.ensure_conversation('fiction-chat', '2021-01', 'fiction')
+    memory.append_turn(evidence, '合成史实问题', '合成史实回答', [], '2021-01', ai_generated=True)
+    memory.append_turn(fiction, '合成虚构问题', '合成虚构回答', [], '2021-01', ai_generated=True,
+                       relationship_mode='fiction')
+    assert memory.history(evidence, '2021-01', relationship_mode='evidence')[-1]['content'] == '合成史实回答'
+    assert memory.history(fiction, '2021-01', relationship_mode='fiction')[-1]['content'] == '合成虚构回答'
+    with pytest.raises(ValueError):
+        memory.ensure_conversation('fiction-chat', '2021-01', 'evidence')
+    with pytest.raises(ValueError):
+        memory.history(fiction, '2021-01', relationship_mode='evidence')
+    stored = memory.collection.get(where={'relationship_mode': 'fiction'}, include=['metadatas'])
+    assert stored['ids'] and all(row['relationship_mode'] == 'fiction' for row in stored['metadatas'])
+
+
+def test_duplicate_retry_returns_same_turn_without_new_memory(tmp_path):
+    memory = SessionMemory(tmp_path, owner=9, slug='synthetic', embedder=StubEmbedder())
+    cid = memory.ensure_conversation('retry-chat', '2021-01', 'fiction')
+    first = memory.append_turn(cid, '合成重试', '合成首次回复', [{'source_line': 3}], '2021-01',
+                               ai_generated=True, relationship_mode='fiction')
+    duplicate = memory.duplicate_turn(cid, '合成重试', relationship_mode='fiction', within_seconds=45)
+    assert duplicate['turn_id'] == first['turn_id'] and duplicate['reply'] == '合成首次回复'
+    assert duplicate['sources'] == [{'source_line': 3}]
+    assert memory.duplicate_turn(cid, '合成重试', relationship_mode='evidence') is None
+    assert memory.duplicate_turn(cid, '另一句', relationship_mode='fiction') is None
+    assert memory.stats()['turns'] == 1

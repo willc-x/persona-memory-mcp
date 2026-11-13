@@ -818,3 +818,53 @@ def test_overlap_chunks_dedupe_same_canonical_message(isolated_runtime):
         chunks.append(chunk)
     _, sources = t.engine(vector_store=HistoryFixture(chunks), embedder=object())._prepare_turn("coffee", [])
     assert len([source for source in sources if source["source"] == "chat"]) == 1
+
+
+def test_corpus_style_stats_inject_short_reply_guidance_without_quotes(isolated_runtime):
+    t = isolated_runtime
+    engine = t.engine()
+    engine.style_profile = SimpleNamespace(
+        avg_message_chars=9.03, messages_per_reply=1.03, no_end_punct_rate=0.95,
+        emoji_rate=0.0006, top_fillers=["哈哈", "啊", "吧"], sample_size=16912,
+    )
+    messages, _sources = engine._prepare_turn("在吗", [])
+    prompt = messages[0]["content"]
+    assert "## 目标人物真实表达习惯" in prompt
+    assert "平均每条9字" in prompt and "句末经常不打标点" in prompt
+    assert "优先回一条很短的消息" in prompt
+    assert "不要套用" in prompt
+    assert "【AI模拟回复】" not in prompt and "PRIVATE_RAW_MESSAGE" not in prompt
+
+
+def test_fiction_mode_prompt_is_explicit_and_keeps_history_boundary(isolated_runtime):
+    t = isolated_runtime
+    fiction = t.engine(t.persona(), relationship_mode="fiction")
+    messages, _sources = fiction._prepare_turn("好想你", [])
+    prompt = messages[0]["content"]
+    assert "当前虚构亲密模式" in prompt
+    assert "不得说成真实聊天记录中的历史" in prompt
+    assert "绝不能覆盖真实历史事实" in prompt
+    evidence = t.engine(t.persona())
+    evidence_prompt = evidence._prepare_turn("好想你", [])[0][0]["content"]
+    assert "当前虚构亲密模式" not in evidence_prompt
+    assert "不自动假设浪漫关系" in evidence_prompt
+
+
+class KeywordFixture:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def keyword_results(self, query, limit=4, source_tag="chat"):
+        return copy.deepcopy(self.rows[:limit])
+
+
+def test_lexical_fallback_is_merged_before_vector_fragments(isolated_runtime):
+    t = isolated_runtime
+    store = HistoryFixture([])
+    store.history = KeywordFixture([_rag("我不喜欢吃蛋糕 但是我喜欢吃炸鸡柳 炸蘑菇这些", line=6440)])
+    engine = t.engine(vector_store=store, embedder=object(), owner=77, relationship_mode="fiction")
+    messages, sources = engine._prepare_turn("你记得咱俩以前喜欢吃什么吗", [])
+    assert [source["text"] for source in sources if source.get("source") == "chat"] == [
+        "我不喜欢吃蛋糕 但是我喜欢吃炸鸡柳 炸蘑菇这些"
+    ]
+    assert "我不喜欢吃蛋糕 但是我喜欢吃炸鸡柳 炸蘑菇这些" in messages[0]["content"]

@@ -40,6 +40,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=5000)
     era: Optional[str] = Field(default=None, max_length=80)
     conversation_id: Optional[str] = Field(default=None, max_length=80)
+    relationship_mode: str = Field(default='evidence', pattern='^(evidence|fiction)$')
 
 
 class RuntimeState:
@@ -63,7 +64,7 @@ class RuntimeState:
         with self._lock:
             return self._conversation_locks.setdefault(conversation_id, threading.Lock())
 
-    def engine(self, era=None):
+    def engine(self, era=None, relationship_mode='evidence'):
         from adapters.runtime_adapter import GroundedChatEngine
         provider = _read_json(PROVIDER_PATH)
         # 显式传配置；模型请求仍由privacy client选定，绝不回落到上游默认密钥。
@@ -74,7 +75,8 @@ class RuntimeState:
                              slug=self.slug, owner=self.owner, history=self.history)
         persona_dir = Path(self.installation['persona_directory']) / 'runtime'
         engine = GroundedChatEngine(self.slug, owner=self.owner, vector_store=store, embedder=self.embedder,
-                                   persona_dir=persona_dir, era=era, model_config=model_config)
+                                   persona_dir=persona_dir, era=era, model_config=model_config,
+                                   relationship_mode=relationship_mode)
         if getattr(engine, '_cutoff', None) is not None:
             cutoff = engine._cutoff
             store.cutoff = int(cutoff.replace(tzinfo=cutoff.tzinfo or timezone.utc).timestamp())
@@ -208,7 +210,8 @@ def attach_routes(app, state_factory=None):
         era = _era(req.era)
         try:
             engine = state.engine(era)  # 日期校验应在API请求前完成。
-            conversation_id = state.sessions.ensure_conversation(req.conversation_id, era)
+            engine.relationship_mode = req.relationship_mode
+            conversation_id = state.sessions.ensure_conversation(req.conversation_id, era, req.relationship_mode)
         except ValueError:
             raise HTTPException(status_code=400, detail='时期/会话ID无效或与既有会话不一致') from None
         except FileNotFoundError:
@@ -217,13 +220,15 @@ def attach_routes(app, state_factory=None):
             raise HTTPException(status_code=429, detail='已有两个请求运行，请稍后再试')
         try:
             with state.conversation_lock(conversation_id):
-                history = state.sessions.history(conversation_id, era)
-                engine.session_memories = state.sessions.search(message, era=era)
+                history = state.sessions.history(conversation_id, era, relationship_mode=req.relationship_mode)
+                engine.session_memories = state.sessions.search(message, era=era, relationship_mode=req.relationship_mode)
                 reply, _stickers, usage, sources = engine.chat_with_sources(message, history, conversation_id)
                 sources = state.verifier.enrich_sources(sources)
-                saved = state.sessions.append_turn(conversation_id, message, reply, sources, era, ai_generated=True)
+                saved = state.sessions.append_turn(conversation_id, message, reply, sources, era, ai_generated=True,
+                                                   relationship_mode=req.relationship_mode)
                 return {'reply': reply, 'sources': sources, 'conversation_id': conversation_id,
-                        'era': req.era or 'latest', 'relationship_era': engine.selected_era,
+                        'era': req.era or 'latest', 'relationship_mode': req.relationship_mode,
+                        'relationship_era': engine.selected_era,
                         'supported_relationship_era': engine.supported_era, 'memory': {'turn_id': saved['turn_id'], 'conversation_id': saved['conversation_id'], 'indexed': saved['indexed']},
                         'persona_status': engine.artifact_status,
                         'usage': {'prompt_tokens': getattr(usage, 'prompt_tokens', None),
@@ -278,8 +283,8 @@ def create_private_app(test_mode=False, state_factory=None):
         retained = {'/api/auth/login', '/api/auth/logout', '/health', '/health/ready', '/openapi.json'}
         app.router.routes[:] = [route for route in app.router.routes
                                if getattr(route, 'path', None) in retained or not str(getattr(route, 'path', '')).startswith(('/api/', '/static', '/metrics'))]
-        app.title = 'ex-memory · 真实聊天历史与 AI 模拟'
-        app.description = '本地证据检索、分时期画像、独立AI会话；所有模拟回复不代表真人思想。'
+        app.title = 'ex-memory · 真实聊天历史与分时期对话'
+        app.description = '本地证据检索、分时期画像、独立会话记忆。'
         app.openapi_schema = None
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', '127.0.0.1', '[::1]'] + (['testserver'] if test_mode else []))
     return attach_routes(app, state_factory)
